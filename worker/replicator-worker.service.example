@@ -1,0 +1,18 @@
+[Unit]
+Description=Replicator Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/replicator/worker
+ExecStart=%h/replicator/worker/.venv/bin/python %h/replicator/worker/main.py
+Restart=always
+RestartSec=5
+EnvironmentFile=/etc/replicator-worker.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,26 @@
+# Local environment files
+web/.env.local
+worker/.env
+/.env
+
+# Profiles and local artifacts
+profiles/
+supabase/.temp/
+
+# Next.js build output
+web/.next/
+web/node_modules/
+web/out/
+web/.vercel/
+
+# macOS
+.DS_Store
+
+# Python venv
+worker/.venv/
+worker/venv/
+worker/worker/.venv/
+
+# Python caches & logs
+worker/__pycache__/
+worker/**/*.log
