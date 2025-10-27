@@ -193,15 +193,15 @@ export default function ChatPanel(_props: ChatPanelProps) {
               <div className="mx-auto max-w-[560px] text-center">
                 <div className="space-y-20 text-[13px] leading-7">
                   <div className="flex flex-col items-center">
-                    <span className="font-semibold text-tealGlow">Specify</span>
+                    <span className="font-semibold text-tealGlow/80">Specify</span>
                     <span className="mt-0 text-white/60">Describe what you want to make.</span>
                   </div>
                   <div className="flex flex-col items-center">
-                    <span className="font-semibold text-tealGlow">Visualize</span>
+                    <span className="font-semibold text-tealGlow/80">Visualize</span>
                     <span className="mt-0 text-white/60">generate some concepts.</span>
                   </div>
                   <div className="flex flex-col items-center">
-                    <span className="font-semibold text-tealGlow">Materialize</span>
+                    <span className="font-semibold text-tealGlow/80">Materialize</span>
                     <span className="mt-0 text-white/60">make a 3D model.</span>
                   </div>
                 </div>
