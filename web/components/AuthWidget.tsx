@@ -9,7 +9,8 @@ export default function AuthWidget({ onAuth }: { onAuth?: (userId: string | null
   const [loading, setLoading] = useState(false)
   const [userId, setUserId] = useState<string | null>(null)
   const [msg, setMsg] = useState<string | null>(null)
-  const ALLOW_EMAIL = false
+  const ALLOW_EMAIL = (process.env.NEXT_PUBLIC_ALLOW_EMAIL_SIGNIN ?? '1').toString().toLowerCase() !== '0' &&
+    (process.env.NEXT_PUBLIC_ALLOW_EMAIL_SIGNIN ?? '1').toString().toLowerCase() !== 'false'
 
   useEffect(() => {
     let mounted = true
@@ -119,22 +120,35 @@ export default function AuthWidget({ onAuth }: { onAuth?: (userId: string | null
                 </div>
               </button>
 
+              {/* Optional: Email link beneath Google button */}
               {ALLOW_EMAIL && (
-                <>
-                  <div className="relative flex items-center gap-3 text-xs text-textMuted">
-                    <div className="flex-1 border-t border-white/10" />
-                    <span>or</span>
-                    <div className="flex-1 border-t border-white/10" />
-                  </div>
+                <div className="mt-3 text-center">
                   <button
-                    onClick={() => setMode('magic')}
                     type="button"
-                    className="w-full text-center text-xs text-textMuted transition-colors hover:text-tealGlow"
+                    onClick={() => setMode('magic')}
+                    className="text-xs text-textMuted transition-colors hover:text-textPrimary"
                   >
-                    Continue with email instead →
+                    Sign in with email instead →
                   </button>
-                </>
+                </div>
               )}
+
+          {ALLOW_EMAIL && (
+            <>
+              <div className="relative flex items-center gap-3 text-xs text-textMuted">
+                <div className="flex-1 border-t border-white/10" />
+                <span>or</span>
+                <div className="flex-1 border-t border-white/10" />
+              </div>
+              <button
+                onClick={() => setMode('magic')}
+                type="button"
+                className="w-full text-center text-xs text-textMuted transition-colors hover:text-tealGlow"
+              >
+                Continue with email instead →
+              </button>
+            </>
+          )}
             </>
           )}
 
@@ -160,7 +174,7 @@ export default function AuthWidget({ onAuth }: { onAuth?: (userId: string | null
               <button
                 onClick={signInOtp}
                 disabled={loading || !email}
-                className="w-full rounded-mdx bg-teal px-4 py-3 text-sm font-semibold text-black transition-all hover:bg-tealGlow hover:shadow-[0_0_20px_rgba(46,230,214,0.3)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-teal disabled:hover:shadow-none"
+                className="w-full rounded-mdx bg-white text-black px-4 py-3 text-sm font-semibold transition-all hover:bg-white/90 hover:shadow-[0_0_20px_rgba(255,255,255,0.2)] disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {loading ? 'Please wait...' : 'Continue with email'}
               </button>
@@ -208,7 +222,7 @@ export default function AuthWidget({ onAuth }: { onAuth?: (userId: string | null
               <button
                 onClick={signUpPassword}
                 disabled={loading || !email || !password}
-                className="w-full rounded-mdx bg-teal px-4 py-3 text-sm font-semibold text-black transition-all hover:bg-tealGlow hover:shadow-[0_0_20px_rgba(46,230,214,0.3)] disabled:cursor-not-allowed disabled:opacity-50"
+                className="w-full rounded-mdx bg-white text-black px-4 py-3 text-sm font-semibold transition-all hover:bg-white/90 hover:shadow-[0_0_20px_rgba(255,255,255,0.2)] disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {loading ? 'Please wait...' : 'Create account'}
               </button>
@@ -244,12 +258,12 @@ export default function AuthWidget({ onAuth }: { onAuth?: (userId: string | null
           )}
         </>
       ) : (
-        <div className="space-y-2 text-sm text-textMuted">
-          <div>You are signed in.</div>
+        <div className="flex items-center justify-between rounded-mdx border border-white/10 bg-black/20 px-4 py-3">
+          <div className="text-sm text-textMuted">Signed in</div>
           <button
             onClick={signOut}
             disabled={loading}
-            className="rounded-mdx border border-white/10 bg-white/5 px-3 py-2 text-sm text-textPrimary hover:bg-white/10"
+            className="text-xs text-textMuted transition-colors hover:text-textPrimary disabled:opacity-50"
           >
             Sign out
           </button>
