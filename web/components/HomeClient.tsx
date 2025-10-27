@@ -8,6 +8,9 @@ import LeftRail from '@/components/LeftRail'
 import { useWorkspace } from '@/components/workspace/WorkspaceProvider'
 import AuthModal from '@/components/AuthModal'
 import { supabaseBrowser } from '@/lib/supabaseClient'
+import OrderScope from '@/components/OrderScope'
+// OrderScope is optional state scaffolding. To avoid client-runtime
+// issues in Preview while we stabilize, render without it.
 
 export default function HomeClient() {
   const {
@@ -148,37 +151,44 @@ export default function HomeClient() {
           onRenamingChange={setRailLocked}
         />
       </div>
-      <div className="flex flex-1 min-w-0 gap-4">
-        <div className="flex-1 min-w-0">
-          <Stage
+      <OrderScope
+        orderId={orderId}
+        initialStatus={initialStatus ?? null}
+        initialQuote={initialQuote ?? null}
+        initialVersion={initialVersion ?? 0}
+      >
+        <div className="flex flex-1 min-w-0 gap-4">
+          <div className="flex-1 min-w-0">
+            <Stage
+              key={orderId || 'none'}
+              orderId={orderId}
+              orderRevision={orderRevision}
+              localPreview={stagePreview}
+              onResetWorkspace={resetWorkspace}
+            />
+          </div>
+          <RightConsole
             key={orderId || 'none'}
             orderId={orderId}
-            orderRevision={orderRevision}
-            localPreview={stagePreview}
-            onResetWorkspace={resetWorkspace}
+            loadingSnapshot={loadingSnapshot}
+            initialMessages={initialMessages ?? undefined}
+            initialStatus={initialStatus ?? undefined}
+            initialAttachments={initialAttachments?.map((a: any) => ({
+              assetId: a.asset_id,
+              url: a.url,
+              storageUrl: a.storage_url,
+              expiresAt: a.expires_at,
+              pending: a.pending,
+              label: a.label,
+              name: a.name,
+              size: a.size,
+              contentType: a.content_type,
+            })) ?? undefined}
+            onOrderCreated={handleOrderCreated}
+            onViewerFocus={handleViewerFocus}
           />
         </div>
-        <RightConsole
-          key={orderId || 'none'}
-          orderId={orderId}
-          loadingSnapshot={loadingSnapshot}
-          initialMessages={initialMessages ?? undefined}
-          initialStatus={initialStatus ?? undefined}
-          initialAttachments={initialAttachments?.map((a: any) => ({
-            assetId: a.asset_id,
-            url: a.url,
-            storageUrl: a.storage_url,
-            expiresAt: a.expires_at,
-            pending: a.pending,
-            label: a.label,
-            name: a.name,
-            size: a.size,
-            contentType: a.content_type,
-          })) ?? undefined}
-          onOrderCreated={handleOrderCreated}
-          onViewerFocus={handleViewerFocus}
-        />
-      </div>
+      </OrderScope>
     </main>
   )
 }
