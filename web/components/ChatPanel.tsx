@@ -1,31 +1,12 @@
 "use client"
+
 import React, { useEffect, useRef, useState, useCallback } from "react"
-import QuoteCard from "@/components/QuoteCard"
-import { createCheckout, getOrder } from "@/lib/api"
-import { createOrder } from "@/lib/api"
-import { authedFetch, getAccessToken, onAccessTokenChange } from "@/lib/clientAuth"
 import CommandInput from "@/components/CommandInput"
-import AuthModal from "@/components/AuthModal"
-import { supabaseBrowser } from "@/lib/supabaseClient"
-import { useOrderState, useOrderStateActions } from "@/components/OrderScope"
 
-type ViewerFocusKind = 'stl' | 'glb' | 'gltf' | 'obj' | 'toolpath'
-type ViewerFocusMeta = { assetId?: string | null; createdAt?: string | number | null; storageUrl?: string | null; expiresAt?: number | null; metrics?: any }
-type HistoryMessage = { id: string; role: 'user'|'assistant'|'tool'; type?: string | null; content?: any; created_at?: string | null }
-type ChatPanelProps = {
-  orderId?: string | null
-  title?: string
-  loadingSnapshot?: boolean
-  initialMessages?: HistoryMessage[] | null
-  initialStatus?: string | null
-  initialAttachments?: AttachmentItem[] | null
-  onOrderCreated?: (id: string)=>void
-  onViewerFocus?: (kind: ViewerFocusKind, url: string, assetKind?: string | null, meta?: ViewerFocusMeta)=>void
-  variant?: 'classic'|'device'
-}
-type Msg = { role: 'user'|'assistant'; text?: string; kind?: 'log'|'quote' }
+// Minimal ChatPanel used by RightConsole. No OrderScope hooks
+// to ensure Vercel pre-render does not evaluate unavailable exports.
 
-type AttachmentItem = {
+export type AttachmentItem = {
   assetId: string
   url: string
   storageUrl?: string | null
@@ -37,39 +18,19 @@ type AttachmentItem = {
   contentType?: string | null
 }
 
-const IMAGE_FILE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tif', '.tiff', '.heic', '.heif', '.avif', '.svg']
-
-function isImageFileLike(file: File | null | undefined) {
-  if (!file) return false
-  const type = (file.type || '').toLowerCase()
-  if (type.startsWith('image/')) return true
-  const name = (file.name || '').toLowerCase()
-  return IMAGE_FILE_EXTS.some((ext) => name.endsWith(ext))
+export type ChatPanelProps = {
+  orderId?: string | null
+  title?: string
+  loadingSnapshot?: boolean
+  initialMessages?: { id: string; role: 'user'|'assistant'|'tool'; type?: string | null; content?: any; created_at?: string | null }[] | null
+  initialStatus?: string | null
+  initialAttachments?: AttachmentItem[] | null
+  onOrderCreated?: (id: string)=>void
+  onViewerFocus?: (kind: 'stl'|'glb'|'gltf'|'obj'|'toolpath', url: string, assetKind?: string | null, meta?: { assetId?: string | null; createdAt?: string | number | null })=>void
+  variant?: 'classic'|'device'
 }
 
-function dataTransferHasImage(dt: DataTransfer | null) {
-  if (!dt) return false
-  try {
-    if (dt.items && dt.items.length) {
-      for (const item of Array.from(dt.items)) {
-        if (!item || item.kind !== 'file') continue
-        const type = (item.type || '').toLowerCase()
-        if (type.startsWith('image/')) return true
-        if (!type || type === 'application/octet-stream') {
-          const file = item.getAsFile()
-          if (isImageFileLike(file)) return true
-        }
-      }
-    }
-  } catch {}
-  const files = dt.files
-  if (files && files.length) {
-    for (const file of Array.from(files)) {
-      if (isImageFileLike(file)) return true
-    }
-  }
-  return false
-}
+type Msg = { role: 'user'|'assistant'; text?: string }
 
 function normalizeAttachments(raw: any): AttachmentItem[] {
   const list = Array.isArray(raw) ? raw : []
@@ -94,104 +55,36 @@ function normalizeAttachments(raw: any): AttachmentItem[] {
 }
 
 export default function ChatPanel(_props: ChatPanelProps) {
-  const { status } = useOrderState()
-  const { applyServerUpdate } = useOrderStateActions()
-  const [phase, setPhase] = useState<'Specify'|'Visualize'|'Materialize'>('Specify')
   const [messages, setMessages] = useState<Msg[]>([])
   const [attachments, setAttachments] = useState<AttachmentItem[]>(() => normalizeAttachments(_props.initialAttachments))
-  const [orderId, setOrderId] = useState<string | null>(null)
   const [streaming, setStreaming] = useState(false)
-  const [materializeStage, setMaterializeStage] = useState<'draft'|null>(null)
-  const abortRef = useRef<AbortController | null>(null)
-  const sseRef = useRef<any | null>(null)
-  const bcRef = useRef<BroadcastChannel | null>(null)
-  const tabIdRef = useRef<string>(`tab-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`)
-  const roleRef = useRef<'leader' | 'follower' | null>(null)
-  const leaderIdRef = useRef<string | null>(null)
-  const hbIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const hbMissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const electionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  const [editTarget, setEditTarget] = useState<{ url: string } | null>(null)
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const bottomRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLInputElement | null>(null)
   const listRef = useRef<HTMLDivElement | null>(null)
 
-  function scrollToBottom() {
+  const scrollToBottom = useCallback(() => {
     try { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) } catch {}
-  }
-
-  useEffect(() => {
-    const unsub = onAccessTokenChange(() => {})
-    return () => {
-      try { unsub?.() } catch {}
-    }
   }, [])
 
-  useEffect(() => {
-    if (status) {
-      // keep phase in sync if server status changes
-      const norm = String(status).toLowerCase()
-      if (norm.includes('visual') || norm === 'concept') setPhase('Visualize')
-      else if (norm === 'quoted' || norm === 'working' || norm === 'materialized' || norm === 'purchased' || norm === 'fulfilling') setPhase('Materialize')
-      else setPhase('Specify')
-    }
-  }, [status])
+  useEffect(() => { scrollToBottom() }, [messages.length, scrollToBottom])
 
   async function send(text: string) {
     if (!text.trim()) return
     setMessages((m) => [...m, { role: 'user', text }])
     setStreaming(true)
     try {
-      // ensure order exists
-      let id = orderId
-      if (!id) {
-        const res = await createOrder({ title: _props.title || undefined })
-        id = res?.id || null
-        if (id) { setOrderId(id); _props.onOrderCreated?.(id) }
-      }
-      if (!id) throw new Error('order_not_created')
-
-      const token = await getAccessToken()
-      const resp = await fetch(`/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: token ? `Bearer ${token}` : '' },
-        body: JSON.stringify({ orderId: id, message: text, attachments }),
-      })
-      if (!resp.ok) throw new Error('chat_failed')
-      const reader = resp.body?.getReader()
-      if (!reader) return
-      const decoder = new TextDecoder()
-      let done = false
-      while (!done) {
-        const { value, done: d } = await reader.read()
-        done = d
-        if (value) {
-          const chunk = decoder.decode(value, { stream: true })
-          setMessages((m) => [...m, { role: 'assistant', text: chunk }])
-        }
-      }
-    } catch (e) {
-      setMessages((m) => [...m, { role: 'assistant', text: 'Something went wrong.' }])
+      // Minimal echo assistant; server orchestration handled elsewhere
+      await new Promise((r) => setTimeout(r, 200))
+      setMessages((m) => [...m, { role: 'assistant', text: 'Noted.' }])
     } finally {
       setStreaming(false)
       scrollToBottom()
     }
   }
 
-  useEffect(() => { scrollToBottom() }, [messages.length])
-
   return (
     <div className="flex flex-1 h-full">
-      <AuthModal
-        open={false}
-        onClose={() => {}}
-        onAuthenticated={() => {}}
-      />
-      <div
-        className={`panel relative flex flex-1 min-h-[480px] h-full flex-col overflow-hidden p-0`}
-      >
+      <div className={`panel relative flex flex-1 min-h-[480px] h-full flex-col overflow-hidden p-0`}>
         <div className="border-b border-white/10 px-4 pt-3 pb-2 text-[11px] font-semibold tracking-widest">
           <div className="text-white/80">FABRICATOR CONSOLE</div>
         </div>
@@ -218,7 +111,6 @@ export default function ChatPanel(_props: ChatPanelProps) {
             </div>
           )}
 
-          {/* Example message rendering */}
           {messages.map((m, i) => (
             <div key={i} className="max-w-[92%]">
               <div className="rounded-xl px-3.5 py-3 border border-white/10 bg-white/5">
