@@ -4,8 +4,8 @@ import { useEffect } from 'react'
 export default function SWRegister() {
   useEffect(() => {
     if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return
-    const prod = process.env.NODE_ENV === 'production'
-    const enabled = true // enable in dev too for local testing
+    const flag = (process.env.NEXT_PUBLIC_ENABLE_SW || '0').toLowerCase()
+    const enabled = ['1','true','yes','on'].includes(flag)
     if (!enabled) return
     const url = '/sw.js'
     navigator.serviceWorker
