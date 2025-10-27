@@ -1,6 +1,12 @@
 import { createAdminClient } from '@/lib/supabaseAdmin'
 import PrintNowButton from '@/components/PrintNowButton'
 
+// Ensure this page is always rendered at request time to avoid build-time
+// prerender hitting the database (which can fail in Preview when schemas
+// are mid-migration). This mirrors other API routes that are dynamic.
+export const dynamic = 'force-dynamic'
+export const runtime = 'nodejs'
+
 type Row = {
   id: string
   status: string
@@ -14,7 +20,7 @@ async function getOrders(): Promise<Row[]> {
   const { data, error } = await supabase
     .from('orders')
     .select('id,status,created_at,quote_json')
-    .in('status', ['ready_to_pay','paid','needs_review','dispatching','printing'])
+    .in('status', ['quoted','fulfilling','needs_review'])
     .order('created_at', { ascending: false })
     .limit(100)
   if (error) throw error
@@ -81,7 +87,7 @@ export default async function OperatorPage() {
                     <td className="py-2 pr-4 text-textMuted font-mono text-xs">{new Date(o.created_at).toLocaleString()}</td>
                     <td className="py-2 pr-4">{quote}</td>
                     <td className="py-2 pr-4">
-                      {(o.status === 'paid' || o.status === 'ready_to_pay') && o.has_three_mf ? (
+                      {(o.status === 'purchased' || o.status === 'quoted') && o.has_three_mf ? (
                         <PrintNowButton orderId={o.id} />
                       ) : null}
                     </td>
