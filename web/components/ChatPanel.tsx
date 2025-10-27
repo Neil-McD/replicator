@@ -147,24 +147,29 @@ async function getStlCache(): Promise<Cache | null> {
   }
 }
 
-// ... file continues ...
+// ... (unchanged code above this comment)
       <div className="border-b border-white/10 px-4 pt-3 pb-2 text-[11px] font-semibold tracking-widest">
         <div className="text-white/80">FABRICATOR CONSOLE</div>
       </div>
       <div ref={listRef} className="relative flex-1 space-y-3 overflow-y-auto no-scrollbar p-4">
-        {messages.map((m, i) => {
-          // Angles loading skeleton card (no timers)
-          if (m.role === 'assistant' && (m as any).kind === 'angles_loading') {
-            return (
-              <div key={i} className="max-w-[92%]">
-                <div className="rounded-xl border border-white/10 bg-white/5 p-3 shadow-[inset_0_0_0_1px_rgba(46,230,214,.08)]">
-                  <div className="mb-2 flex items-center gap-2">
-                    <svg viewBox="0 0 24 24" className="h-5 w-5 text-teal" aria-hidden>
-                      <rect x="5" y="8" width="14" height="10" rx="4" stroke="currentColor" strokeWidth="2" fill="none" />
-                      <circle cx="9" cy="13" r="1" fill="currentColor" />
-                      <circle cx="15" cy="13" r="1" fill="currentColor" />
-                      <line x1="12" y1="3" x2="12" y2="7" stroke="currentColor" strokeWidth="2" />
-                      <circle cx="12" cy="2" r="1" fill="currentColor" />
-                      <line x1="9" y1="16" x2="15" y2="16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                    </svg>
-                    <div className="text-xs font-semibold text-white/70">Atom</div>
+        {/* Empty-state helper: brief 3-step guidance (centered only, no header pills) */}
+        {messages.length === 0 && !streaming && !_props.loadingSnapshot && (
+          <div className="pointer-events-none absolute inset-0 grid place-content-center px-6">
+            <div className="mx-auto max-w-[560px] text-center">
+              <div className="space-y-20 text-[13px] leading-7">
+                <div className="flex flex-col items-center">
+                  <span className="font-semibold text-tealGlow/50">Specify</span>
+                  <span className="mt-0 text-white/45">Describe what you want to make.</span>
+                </div>
+                <div className="flex flex-col items-center">
+                  <span className="font-semibold text-tealGlow/50">Visualize</span>
+                  <span className="mt-0 text-white/45">generate some concepts.</span>
+                </div>
+                <div className="flex flex-col items-center">
+                  <span className="font-semibold text-tealGlow/50">Materialize</span>
+                  <span className="mt-0 text-white/45">make a 3D model.</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
