@@ -1,5 +1,5 @@
 "use client"
-import React, { useEffect, useRef, useState, useCallback } from "react"
+import React, { useEffect, useRef, useState, useCallback, useMemo } from "react"
 import QuoteCard from "@/components/QuoteCard"
 import { createCheckout, getOrder } from "@/lib/api"
 import { createOrder } from "@/lib/api"
@@ -343,7 +343,7 @@ export default function ChatPanel(_props: ChatPanelProps) {
   function pushMeshCard(payload: any) {
     if (!payload || typeof payload !== 'object') return
     const orientation = payload?.orientation && typeof payload.orientation === 'object' ? payload.orientation : null
-    const sliceCheck = payload?.slice_check && typeof sliceCheck === 'object' ? payload.slice_check : null
+    const sliceCheck = payload?.slice_check && typeof payload.slice_check === 'object' ? payload.slice_check : null
     const sizeBytes = Number(payload?.size_bytes)
     const floatingCount = Number(payload?.floating_component_count)
     const status = typeof payload?.status === 'string' ? payload.status : null
@@ -965,6 +965,21 @@ export default function ChatPanel(_props: ChatPanelProps) {
     } catch {}
   }
 
+  const hasVisibleMessages = useMemo(() => {
+    try {
+      if (!Array.isArray(messages) || messages.length === 0) return false
+      for (const m of messages as any[]) {
+        if (!m) continue
+        if (m.role === 'user') return true
+        if (m.role === 'assistant') {
+          const kind = (m as any).kind
+          if (kind === 'images' || kind === 'mesh' || kind === 'quote') return true
+        }
+      }
+      return false
+    } catch { return false }
+  }, [messages])
+
   return (
     <div className="flex flex-1 h-full">
       <AuthModal
@@ -1000,7 +1015,7 @@ export default function ChatPanel(_props: ChatPanelProps) {
       </div>
       <div ref={listRef} className="relative flex-1 space-y-3 overflow-y-auto no-scrollbar p-4">
         {/* Empty-state helper: brief 3-step guidance (centered only, no header pills) */}
-        {messages.length === 0 && !streaming && (
+        {!hasVisibleMessages && !streaming && (
           <div className="pointer-events-none absolute inset-0 z-10 grid place-content-center px-6">
             <div className="mx-auto max-w-[560px] text-center">
               <div className="space-y-20 text-[13px] leading-7">
