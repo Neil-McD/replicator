@@ -1,12 +1,31 @@
 "use client"
-
 import React, { useEffect, useRef, useState, useCallback } from "react"
-import CommandInput from "@/components/CommandInput"
 import QuoteCard from "@/components/QuoteCard"
-import { authedFetch, getAccessToken } from "@/lib/clientAuth"
+import { createCheckout, getOrder } from "@/lib/api"
 import { createOrder } from "@/lib/api"
+import { authedFetch, getAccessToken, onAccessTokenChange } from "@/lib/clientAuth"
+import CommandInput from "@/components/CommandInput"
+import AuthModal from "@/components/AuthModal"
+import { supabaseBrowser } from "@/lib/supabaseClient"
+import { useOrderState, useOrderStateActions } from "@/components/OrderScope"
 
-export type AttachmentItem = {
+type ViewerFocusKind = 'stl' | 'glb' | 'gltf' | 'obj' | 'toolpath'
+type ViewerFocusMeta = { assetId?: string | null; createdAt?: string | number | null; storageUrl?: string | null; expiresAt?: number | null; metrics?: any }
+type HistoryMessage = { id: string; role: 'user'|'assistant'|'tool'; type?: string | null; content?: any; created_at?: string | null }
+type ChatPanelProps = {
+  orderId?: string | null
+  title?: string
+  loadingSnapshot?: boolean
+  initialMessages?: HistoryMessage[] | null
+  initialStatus?: string | null
+  initialAttachments?: AttachmentItem[] | null
+  onOrderCreated?: (id: string)=>void
+  onViewerFocus?: (kind: ViewerFocusKind, url: string, assetKind?: string | null, meta?: ViewerFocusMeta)=>void
+  variant?: 'classic'|'device'
+}
+type Msg = { role: 'user'|'assistant'; text?: string; kind?: 'log'|'quote' }
+
+type AttachmentItem = {
   assetId: string
   url: string
   storageUrl?: string | null
@@ -18,23 +37,39 @@ export type AttachmentItem = {
   contentType?: string | null
 }
 
-export type ChatPanelProps = {
-  orderId?: string | null
-  title?: string
-  loadingSnapshot?: boolean
-  initialMessages?: { id: string; role: 'user'|'assistant'|'tool'; type?: string | null; content?: any; created_at?: string | null }[] | null
-  initialStatus?: string | null
-  initialAttachments?: AttachmentItem[] | null
-  onOrderCreated?: (id: string)=>void
-  onViewerFocus?: (kind: 'stl'|'glb'|'gltf'|'obj'|'toolpath', url: string, assetKind?: string | null, meta?: { assetId?: string | null; createdAt?: string | number | null })=>void
-  variant?: 'classic'|'device'
+const IMAGE_FILE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tif', '.tiff', '.heic', '.heif', '.avif', '.svg']
+
+function isImageFileLike(file: File | null | undefined) {
+  if (!file) return false
+  const type = (file.type || '').toLowerCase()
+  if (type.startsWith('image/')) return true
+  const name = (file.name || '').toLowerCase()
+  return IMAGE_FILE_EXTS.some((ext) => name.endsWith(ext))
 }
 
-type Msg =
-  | { role: 'user'; text: string }
-  | { role: 'assistant'; kind: 'text'; text: string }
-  | { role: 'assistant'; kind: 'warning'; text: string }
-  | { role: 'assistant'; kind: 'quote'; quote: any }
+function dataTransferHasImage(dt: DataTransfer | null) {
+  if (!dt) return false
+  try {
+    if (dt.items && dt.items.length) {
+      for (const item of Array.from(dt.items)) {
+        if (!item || item.kind !== 'file') continue
+        const type = (item.type || '').toLowerCase()
+        if (type.startsWith('image/')) return true
+        if (!type || type === 'application/octet-stream') {
+          const file = item.getAsFile()
+          if (isImageFileLike(file)) return true
+        }
+      }
+    }
+  } catch {}
+  const files = dt.files
+  if (files && files.length) {
+    for (const file of Array.from(files)) {
+      if (isImageFileLike(file)) return true
+    }
+  }
+  return false
+}
 
 function normalizeAttachments(raw: any): AttachmentItem[] {
   const list = Array.isArray(raw) ? raw : []
@@ -59,196 +94,246 @@ function normalizeAttachments(raw: any): AttachmentItem[] {
 }
 
 export default function ChatPanel(_props: ChatPanelProps) {
+  const { status } = useOrderState()
+  const { applyServerUpdate } = useOrderStateActions()
+  const [phase, setPhase] = useState<'Specify'|'Visualize'|'Materialize'>('Specify')
+  // Atom availability indicator removed per request
   const [messages, setMessages] = useState<Msg[]>([])
   const [attachments, setAttachments] = useState<AttachmentItem[]>(() => normalizeAttachments(_props.initialAttachments))
+  const [orderId, setOrderId] = useState<string | null>(null)
   const [streaming, setStreaming] = useState(false)
-  const [orderId, setOrderId] = useState<string | null>(_props.orderId ?? null)
-
-  const bottomRef = useRef<HTMLDivElement | null>(null)
-  const inputRef = useRef<HTMLTextAreaElement | null>(null)
+  const [materializeStage, setMaterializeStage] = useState<'draft'|null>(null)
+  const abortRef = useRef<AbortController | null>(null)
+  const sseRef = useRef<any | null>(null)
+  // Multi-tab leadership coordination per order
+  const bcRef = useRef<BroadcastChannel | null>(null)
+  const tabIdRef = useRef<string>(`tab-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`)
+  const roleRef = useRef<'leader' | 'follower' | null>(null)
+  const leaderIdRef = useRef<string | null>(null)
+  const hbIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const hbMissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const electionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Track which parent image ids already have a final angles card rendered
+  const anglesRenderedRef = useRef<Set<string>>(new Set())
+  // Track which parent image ids are currently generating angles (for spinner + skeleton)
+  const [anglesLoading, setAnglesLoading] = useState<Set<string>>(new Set())
+  // Track bulk materialize clicks on an angles card (keyed by parent image id)
+  const [anglesBatchInflight, setAnglesBatchInflight] = useState<Set<string>>(new Set())
+  // (Removed timeout guard for angles — per user request)
+  // Track which cards are remixing (per-card animation)
+  const [remixingIds, setRemixingIds] = useState<Set<string>>(new Set())
+  function addRemixing(id: string) { setRemixingIds(prev => { const next = new Set(prev); next.add(id); return next }) }
+  function clearRemixing(id: string) { setRemixingIds(prev => { const next = new Set(prev); next.delete(id); return next }) }
+  function newLocalId() { return `${Date.now()}-${Math.random().toString(36).slice(2)}` }
+  const streamingRef = useRef<boolean>(false)
+  const seenMsgIdsRef = useRef<Set<string>>(new Set())
+  const chatPaintMeasuredRef = useRef<boolean>(false)
+  const historyPrimedRef = useRef<boolean>(false)
   const listRef = useRef<HTMLDivElement | null>(null)
-  const postAbortRef = useRef<AbortController | null>(null)
-  const streamAbortRef = useRef<AbortController | null>(null)
-
-  const scrollToBottom = useCallback(() => {
-    try { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) } catch {}
+  const bottomRef = useRef<HTMLDivElement | null>(null)
+  // Track last asset id we focused to avoid duplicate viewer updates
+  const lastFocusAssetIdRef = useRef<string | null>(null)
+  const historyAppliedOrderRef = useRef<string | null>(null)
+  const processAssistantEventRef = useRef<(evt: any, source?: 'stream' | 'history' | 'channel') => void>(() => {})
+  // Worker health tracking: start when materialization begins, warn if no progress
+  const jobStartAtRef = useRef<number | null>(null)
+  const workerWarnedRef = useRef<boolean>(false)
+  const focusKinds: ViewerFocusKind[] = ['stl','glb','gltf','obj','toolpath']
+  const derivePhaseFromStatus = useCallback((status?: string | null) => {
+    if (!status) return 'Specify'
+    const norm = status.toLowerCase()
+    if (norm.includes('visual') || norm === 'concept') return 'Visualize'
+    return 'Materialize'
   }, [])
+  // Per-image UI state for modeling start
+  const [inflightIds, setInflightIds] = useState<Set<string>>(new Set())
+  const [materializingIds, setMaterializingIds] = useState<Set<string>>(new Set())
+  const authPromptedRef = useRef<boolean>(false)
+  const [tokenVersion, setTokenVersion] = useState<number>(0)
+  const [authModalOpen, setAuthModalOpen] = useState(false)
+  
+  const [remixing, setRemixing] = useState<boolean>(false)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const pendingUserMessageRef = useRef<string | null>(null)
+  const optimisticUserQueueRef = useRef<string[]>([])
+  // Track dismissed quotes by hash (per order)
+  const [dismissedQuotes, setDismissedQuotes] = useState<Set<string>>(new Set())
+  // Inline edit target (selected concept image)
+  const [editTarget, setEditTarget] = useState<{ id: string; url: string } | null>(null)
+  const inputRef = useRef<HTMLTextAreaElement | null>(null)
+  const brokenImagesRef = useRef<Set<string>>(new Set())
+  const [imageDragActive, setImageDragActive] = useState<boolean>(false)
+  const imageDragDepthRef = useRef<number>(0)
+  const { onOrderCreated } = _props
 
-  useEffect(() => { scrollToBottom() }, [messages.length, scrollToBottom])
+  // Revalidate order snapshot when the tab becomes visible to keep shared state fresh
+  useEffect(() => {
+    if (typeof document === 'undefined') return
+    const onVis = async () => {
+      if (document.visibilityState === 'visible' && orderId) {
+        try {
+          const snap = await getOrder(orderId)
+          const status = (snap?.order?.status || '') as string
+          const versionRaw = snap?.order?.version
+          const version = typeof versionRaw === 'number' ? versionRaw : Number(versionRaw)
+          applyServerUpdate({
+            status: status || null,
+            orderVersion: Number.isFinite(version) ? version : undefined,
+            quote: snap?.order?.quote_json ?? null,
+          })
+        } catch {}
+      }
+    }
+    document.addEventListener('visibilitychange', onVis)
+    return () => document.removeEventListener('visibilitychange', onVis)
+  }, [orderId, applyServerUpdate])
 
   useEffect(() => {
-    // Hydrate background SSE when an orderId is present
+    setAttachments(normalizeAttachments(_props.initialAttachments))
+  }, [_props.initialAttachments])
+
+  useEffect(() => {
+    if (attachments.length && phase === 'Specify') {
+      setPhase('Visualize')
+    }
+  }, [attachments, phase])
+
+  const updateAttachmentsState = useCallback((payload: any, opts?: { replace?: boolean }) => {
+    const list = normalizeAttachments(payload?.attachments ?? payload)
+    if (opts?.replace) {
+      setAttachments(list)
+      return
+    }
+    if (!list.length) return
+    setAttachments((prev) => {
+      const map = new Map<string, AttachmentItem>()
+      for (const item of prev) {
+        map.set(item.assetId, item)
+      }
+      for (const item of list) {
+        map.set(item.assetId, { ...map.get(item.assetId), ...item })
+      }
+      return Array.from(map.values())
+    })
+  }, [])
+
+  useEffect(() => {
     if (!orderId) return
-    void startBackgroundStream(orderId)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (typeof window === 'undefined') return
+    const handleAtomLog = (event: Event) => {
+      try {
+        const detail = (event as CustomEvent<{ orderId?: string; text?: string }>).detail
+        if (!detail || detail.orderId !== orderId) return
+        const text = typeof detail.text === 'string' ? detail.text.trim() : ''
+        if (!text) return
+        setMessages((prev) => [...prev, { role: 'assistant', kind: 'log', text }])
+      } catch (err) {
+        console.warn('[ChatPanel] atom log handler failed', err)
+      }
+    }
+    window.addEventListener('fabricator:atom-log', handleAtomLog as EventListener)
+    return () => {
+      window.removeEventListener('fabricator:atom-log', handleAtomLog as EventListener)
+    }
   }, [orderId])
 
-  async function ensureOrder(): Promise<string> {
-    if (orderId) return orderId
-    const title = _props.title || ''
-    const created = await createOrder(title)
-    const id = created.order_id
-    setOrderId(id)
-    _props.onOrderCreated?.(id)
-    void startBackgroundStream(id)
-    return id
-  }
+  useEffect(() => {
+    const resetDrag = () => {
+      imageDragDepthRef.current = 0
+      setImageDragActive(false)
+    }
+    window.addEventListener('dragend', resetDrag)
+    window.addEventListener('drop', resetDrag)
+    return () => {
+      window.removeEventListener('dragend', resetDrag)
+      window.removeEventListener('drop', resetDrag)
+    }
+  }, [])
 
-  async function startBackgroundStream(id: string) {
+  // Derive a stable quote hash for dismissal and change-detection
+  const computeQuoteHash = useCallback((q: any) => {
     try {
-      const token = await getAccessToken()
-      const url = new URL(`/api/chat/stream`, window.location.origin)
-      url.searchParams.set('orderId', id)
-      if (token) url.searchParams.set('access_token', token)
-      streamAbortRef.current?.abort()
-      const ac = new AbortController()
-      streamAbortRef.current = ac
-      const resp = await fetch(url.toString(), { signal: ac.signal })
-      if (!resp.ok || !resp.body) return
-      const reader = resp.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      for (;;) {
-        const { value, done } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        let idx
-        while ((idx = buffer.indexOf("\n\n")) !== -1) {
-          const chunk = buffer.slice(0, idx)
-          buffer = buffer.slice(idx + 2)
-          const line = chunk.split("\n").find((l)=>l.startsWith('data: '))
-          if (!line) continue
-          try {
-            const payload = JSON.parse(line.slice(6))
-            handleEvent(payload)
-          } catch {}
-        }
-      }
-    } catch {}
+      if (!q || typeof q !== 'object') return null
+      const total = (q.total_cents ?? q.price_cents)
+      const grams = q.grams
+      const minutes = q.minutes
+      if (typeof total !== 'number') return null
+      const g = Number.isFinite(Number(grams)) ? Number(grams) : 'x'
+      const m = Number.isFinite(Number(minutes)) ? Number(minutes) : 'x'
+      return `${total}_${g}_${m}`
+    } catch { return null }
+  }, [])
+
+  // Helper to mark a quote hash as dismissed and persist to localStorage
+  const dismissQuoteHash = useCallback((hash: string | null) => {
+    if (!hash) return
+    setDismissedQuotes((prev) => { const next = new Set(prev); next.add(hash); return next })
+    try { if (orderId) localStorage.setItem(`quote_dismissed:${orderId}:${hash}`, 'true') } catch {}
+  }, [orderId])
+
+  function addInflight(id: string) {
+    setInflightIds((prev) => { const next = new Set(prev); next.add(id); return next })
+  }
+  function clearInflight(id: string) {
+    setInflightIds((prev) => { const next = new Set(prev); next.delete(id); return next })
+  }
+  function addMaterializing(ids: string[]) {
+    if (!ids || !ids.length) return
+    setMaterializingIds((prev) => { const next = new Set(prev); for (const i of ids) next.add(i); return next })
+  }
+  function clearMaterializing(ids?: string[]) {
+    if (!ids) { setMaterializingIds(new Set()); return }
+    setMaterializingIds((prev) => { const next = new Set(prev); for (const i of ids) next.delete(i); return next })
   }
 
-  function handleEvent(evt: any) {
-    if (!evt) return
-    const role = evt.role
-    const type = evt.type
-    const content = evt.content || {}
-    if (role === 'assistant' && type === 'text' && typeof content.text === 'string') {
-      setMessages((m) => [...m, { role: 'assistant', kind: 'text', text: content.text }])
-    } else if (role === 'assistant' && type === 'warning' && typeof content.text === 'string') {
-      setMessages((m) => [...m, { role: 'assistant', kind: 'warning', text: content.text }])
-    } else if (role === 'assistant' && type === 'card.quote') {
-      setMessages((m) => [...m, { role: 'assistant', kind: 'quote', quote: content }])
+  const removeAttachment = useCallback((assetId: string) => {
+    if (!assetId) return
+    setAttachments((prev) => prev.filter((item) => item.assetId !== assetId))
+  }, [])
+
+  function applyMaterializeStage(stageValue?: string | null) {
+    if (!stageValue || typeof stageValue !== 'string') return
+    const norm = stageValue.trim().toLowerCase()
+    if (norm === 'draft' || norm === 'refine' || norm === 'high') {
+      setMaterializeStage('draft')
     }
   }
 
-  async function send(text: string) {
-    if (!text.trim()) return
-    setMessages((m) => [...m, { role: 'user', text }])
-    setStreaming(true)
-    try {
-      const id = await ensureOrder()
-      postAbortRef.current?.abort()
-      const ac = new AbortController()
-      postAbortRef.current = ac
-      const resp = await authedFetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ orderId: id, message: text, attachments }),
-        signal: ac.signal as any,
-      })
-      if (!resp.ok || !resp.body) return
-      const reader = resp.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      for (;;) {
-        const { value, done } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        let idx
-        while ((idx = buffer.indexOf("\n\n")) !== -1) {
-          const chunk = buffer.slice(0, idx)
-          buffer = buffer.slice(idx + 2)
-          const line = chunk.split("\n").find((l)=>l.startsWith('data: '))
-          if (!line) continue
-          try {
-            const payload = JSON.parse(line.slice(6))
-            handleEvent(payload)
-          } catch {}
-        }
-      }
-    } finally {
-      setStreaming(false)
-      scrollToBottom()
-    }
+  function formatBytesShort(bytes?: number | null): string | null {
+    if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) return null
+    if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+    if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`
+    return `${bytes.toFixed(0)} B`
   }
 
-  return (
-    <div className="flex flex-1 h-full">
-      <div className={`panel relative flex flex-1 min-h-[480px] h-full flex-col overflow-hidden p-0`}>
-        <div className="border-b border-white/10 px-4 pt-3 pb-2 text-[11px] font-semibold tracking-widest">
-          <div className="text-white/80">FABRICATOR CONSOLE</div>
-        </div>
-        <div ref={listRef} className="relative flex-1 space-y-3 overflow-y-auto no-scrollbar p-4">
-          {/* Empty-state helper (centered only, no header pills) */}
-          {messages.length === 0 && !streaming && !_props.loadingSnapshot && (
-            <div className="pointer-events-none absolute inset-0 grid place-content-center px-6">
-              <div className="mx-auto max-w-[560px] text-center">
-                <div className="space-y-20 text-[13px] leading-7">
-                  <div className="flex flex-col items-center">
-                    <span className="font-semibold text-tealGlow/50">Specify</span>
-                    <span className="mt-0 text-white/45">Describe what you want to make.</span>
-                  </div>
-                  <div className="flex flex-col items-center">
-                    <span className="font-semibold text-tealGlow/50">Visualize</span>
-                    <span className="mt-0 text-white/45">generate some concepts.</span>
-                  </div>
-                  <div className="flex flex-col items-center">
-                    <span className="font-semibold text-tealGlow/50">Materialize</span>
-                    <span className="mt-0 text-white/45">make a 3D model.</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
+  function formatBoundingBox(bbox: any): string | null {
+    if (!bbox || typeof bbox !== 'object') return null
+    const x = Number((bbox as any).x)
+    const y = Number((bbox as any).y)
+    const z = Number((bbox as any).z)
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null
+    return `${Math.round(x)} × ${Math.round(y)} × ${Math.round(z)} mm`
+  }
 
-          {messages.map((m, i) => (
-            <div key={i} className="max-w-[92%]">
-              <div className="rounded-xl px-3.5 py-3 border border-white/10 bg-white/5">
-                <div className="mb-1 text-[11px] uppercase tracking-wider text-white/70">
-                  {m.role === 'assistant' ? 'Atom' : 'Command'}
-                </div>
-                {m.role === 'assistant' && m.kind === 'quote' ? (
-                  <QuoteCard
-                    previewUrl={m.quote?.preview_url}
-                    minutes={m.quote?.minutes}
-                    grams={m.quote?.grams}
-                    priceCents={m.quote?.price_cents}
-                    totalCents={m.quote?.total_cents}
-                    productCents={m.quote?.product_cents}
-                    laborCents={m.quote?.labor_cents}
-                    shippingCents={m.quote?.shipping_cents}
-                    canPay={false}
-                  />
-                ) : (
-                  <div className="text-sm leading-6">{(m as any).text}</div>
-                )}
-              </div>
-            </div>
-          ))}
-          <div ref={bottomRef} />
-        </div>
-        <div className="border-t border-white/10 bg-black/20 p-0">
-          <CommandInput
-            onSend={send}
-            disabled={streaming}
-            loading={streaming}
-            inputRef={inputRef as any}
-            onUpload={() => {}}
-            attachments={attachments}
-            onAttachmentRemove={() => {}}
-          />
-        </div>
-      </div>
-    </div>
-  )
-}
+  function pushMeshCard(payload: any) {
+    if (!payload || typeof payload !== 'object') return
+    const orientation = payload?.orientation && typeof payload.orientation === 'object' ? payload.orientation : null
+    const sliceCheck = payload?.slice_check && typeof payload.slice_check === 'object' ? payload.slice_check : null
+    const sizeBytes = Number(payload?.size_bytes)
+    const floatingCount = Number(payload?.floating_component_count)
+    const status = typeof payload?.status === 'string' ? payload.status : null
+    const parts: string[] = []
+    if (orientation && typeof orientation === 'object') {
+      const bbox = (orientation as any).bbox_mm
+      if (bbox && typeof bbox === 'object') {
+        const sx = Number((bbox as any).x)
+        const sy = Number((bbox as any).y)
+        const sz = Number((bbox as any).z)
+        if (Number.isFinite(sx) && Number.isFinite(sy) && Number.isFinite(sz)) {
+          parts.push(`size ${Math.round(sx)} × ${Math.round(sy)} × ${Math.round(sz)} mm`)
+        }
+      }
+    }
+    if (Number.isFinite(sizeBytes) && sizeBytes > 0) {
+      parts.push(`file ${(sizeBytes / (1024 * 1024)).toF
+...
