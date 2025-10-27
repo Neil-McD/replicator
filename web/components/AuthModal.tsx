@@ -16,7 +16,7 @@ export default function AuthModal({ open, onAuthenticated, title, onClose }: {
       <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" />
 
       {/* Neutral gray card; non-dismissable */}
-      <div className="relative z-10 w-full max-w-[460px] overflow-hidden rounded-lgx border border-white/12 bg-neutral-900/95 shadow-modal">
+      <div className="relative z-10 w-full max-w-[460px] overflow-hidden rounded-lgx bg-neutral-900/95 shadow-modal">
         {/* Heading */}
         <div className="px-6 pt-6 pb-1">
           <h2 className="text-2xl font-semibold text-textPrimary">{heading}</h2>

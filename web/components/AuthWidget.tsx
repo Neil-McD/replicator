@@ -120,20 +120,7 @@ export default function AuthWidget({ onAuth }: { onAuth?: (userId: string | null
                 </div>
               </button>
 
-              {/* Optional: Email link beneath Google button */}
-              {ALLOW_EMAIL && (
-                <div className="mt-3 text-center">
-                  <button
-                    type="button"
-                    onClick={() => setMode('magic')}
-                    className="text-xs text-textMuted transition-colors hover:text-textPrimary"
-                  >
-                    Sign in with email instead →
-                  </button>
-                </div>
-              )}
-
-          {ALLOW_EMAIL && (
+           {ALLOW_EMAIL && (
             <>
               <div className="relative flex items-center gap-3 text-xs text-textMuted">
                 <div className="flex-1 border-t border-white/10" />
