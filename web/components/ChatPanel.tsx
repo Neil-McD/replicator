@@ -191,20 +191,20 @@ export default function ChatPanel(_props: ChatPanelProps) {
         <div ref={listRef} className="relative flex-1 space-y-3 overflow-y-auto no-scrollbar p-4">
           {/* Empty-state helper (centered only, no header pills) */}
           {messages.length === 0 && !streaming && (
-            <div className="pointer-events-none absolute inset-0 grid place-content-center px-6">
+            <div className="pointer-events-none absolute inset-0 z-10 grid place-content-center px-6">
               <div className="mx-auto max-w-[560px] text-center">
                 <div className="space-y-20 text-[13px] leading-7">
                   <div className="flex flex-col items-center">
-                    <span className="font-semibold text-tealGlow/50">Specify</span>
-                    <span className="mt-0 text-white/45">Describe what you want to make.</span>
+                    <span className="font-semibold text-white/80">Specify</span>
+                    <span className="mt-0 text-white/60">Describe what you want to make.</span>
                   </div>
                   <div className="flex flex-col items-center">
-                    <span className="font-semibold text-tealGlow/50">Visualize</span>
-                    <span className="mt-0 text-white/45">generate some concepts.</span>
+                    <span className="font-semibold text-white/80">Visualize</span>
+                    <span className="mt-0 text-white/60">generate some concepts.</span>
                   </div>
                   <div className="flex flex-col items-center">
-                    <span className="font-semibold text-tealGlow/50">Materialize</span>
-                    <span className="mt-0 text-white/45">make a 3D model.</span>
+                    <span className="font-semibold text-white/80">Materialize</span>
+                    <span className="mt-0 text-white/60">make a 3D model.</span>
                   </div>
                 </div>
               </div>
