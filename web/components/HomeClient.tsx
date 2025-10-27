@@ -149,37 +149,35 @@ export default function HomeClient() {
         />
       </div>
       <div className="flex flex-1 min-w-0 gap-4">
-        <OrderScope orderId={orderId} initialStatus={initialStatus ?? null} initialQuote={initialQuote ?? null} initialVersion={initialVersion}>
-          <div className="flex-1 min-w-0">
-            <Stage
-              key={orderId || 'none'}
-              orderId={orderId}
-              orderRevision={orderRevision}
-              localPreview={stagePreview}
-              onResetWorkspace={resetWorkspace}
-            />
-          </div>
-          <RightConsole
+        <div className="flex-1 min-w-0">
+          <Stage
             key={orderId || 'none'}
             orderId={orderId}
-            loadingSnapshot={loadingSnapshot}
-            initialMessages={initialMessages ?? undefined}
-            initialStatus={initialStatus ?? undefined}
-            initialAttachments={initialAttachments?.map((a: any) => ({
-              assetId: a.asset_id,
-              url: a.url,
-              storageUrl: a.storage_url,
-              expiresAt: a.expires_at,
-              pending: a.pending,
-              label: a.label,
-              name: a.name,
-              size: a.size,
-              contentType: a.content_type,
-            })) ?? undefined}
-            onOrderCreated={handleOrderCreated}
-            onViewerFocus={handleViewerFocus}
+            orderRevision={orderRevision}
+            localPreview={stagePreview}
+            onResetWorkspace={resetWorkspace}
           />
-        </OrderScope>
+        </div>
+        <RightConsole
+          key={orderId || 'none'}
+          orderId={orderId}
+          loadingSnapshot={loadingSnapshot}
+          initialMessages={initialMessages ?? undefined}
+          initialStatus={initialStatus ?? undefined}
+          initialAttachments={initialAttachments?.map((a: any) => ({
+            assetId: a.asset_id,
+            url: a.url,
+            storageUrl: a.storage_url,
+            expiresAt: a.expires_at,
+            pending: a.pending,
+            label: a.label,
+            name: a.name,
+            size: a.size,
+            contentType: a.content_type,
+          })) ?? undefined}
+          onOrderCreated={handleOrderCreated}
+          onViewerFocus={handleViewerFocus}
+        />
       </div>
     </main>
   )
