@@ -154,6 +154,8 @@ export default function ChatPanel(_props: ChatPanelProps) {
   
   const [showProbe, setShowProbe] = useState<boolean>(false)
   const [remixing, setRemixing] = useState<boolean>(false)
+  // Force-show helper until first visible content renders
+  const [showEmpty, setShowEmpty] = useState<boolean>(true)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const pendingUserMessageRef = useRef<string | null>(null)
   const optimisticUserQueueRef = useRef<string[]>([])
@@ -539,6 +541,7 @@ export default function ChatPanel(_props: ChatPanelProps) {
       bcRef.current = null
       roleRef.current = null
       leaderIdRef.current = null
+      setShowEmpty(true)
     }
   }, [_props.orderId, orderId])
 
@@ -602,6 +605,7 @@ export default function ChatPanel(_props: ChatPanelProps) {
         if (payload && typeof payload === 'object') updateAttachmentsState(payload)
         setPhase('Visualize')
         try { window.dispatchEvent(new CustomEvent('workspace:first-activity', { detail: { orderId: oid } })) } catch {}
+        setShowEmpty(false)
       } catch (e: any) {
         if (!String(e?.message || '').includes('not_authenticated')) {
           setMessages((m) => [...m, { role: 'assistant', kind: 'log', text: e?.message || 'upload failed' }])
@@ -677,6 +681,7 @@ export default function ChatPanel(_props: ChatPanelProps) {
     const creatingOrder = !orderId
     if (creatingOrder) pendingUserMessageRef.current = text
     setMessages((m) => [...m, { role: 'user', text }])
+    setShowEmpty(false)
     // If we have an order, call chat SSE; else try to create order
     let oid = orderId
     if (!oid) {
@@ -980,6 +985,11 @@ export default function ChatPanel(_props: ChatPanelProps) {
     } catch { return false }
   }, [messages])
 
+  // Hide the helper once we actually render a visible message
+  useEffect(() => {
+    if (hasVisibleMessages) setShowEmpty(false)
+  }, [hasVisibleMessages])
+
   return (
     <div className="flex flex-1 h-full">
       <AuthModal
@@ -1015,7 +1025,7 @@ export default function ChatPanel(_props: ChatPanelProps) {
       </div>
       <div ref={listRef} className="relative flex-1 space-y-3 overflow-y-auto no-scrollbar p-4">
         {/* Empty-state helper: brief 3-step guidance (centered only, no header pills) */}
-        {!hasVisibleMessages && !streaming && (
+        {showEmpty && !streaming && (
           <div className="pointer-events-none absolute inset-0 z-10 grid place-content-center px-6">
             <div className="mx-auto max-w-[560px] text-center">
               <div className="space-y-20 text-[13px] leading-7">
