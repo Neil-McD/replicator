@@ -6,7 +6,8 @@ import Stage from '@/components/Stage'
 import RightConsole from '@/components/RightConsole'
 import LeftRail from '@/components/LeftRail'
 import { useWorkspace } from '@/components/workspace/WorkspaceProvider'
-import OrderScope from '@/components/OrderScope'
+import AuthModal from '@/components/AuthModal'
+import { supabaseBrowser } from '@/lib/supabaseClient'
 
 export default function HomeClient() {
   const {
@@ -17,6 +18,8 @@ export default function HomeClient() {
     loadingSnapshot,
     initialMessages,
     initialStatus,
+    initialQuote,
+    initialVersion,
     initialAttachments,
     localPreview,
     selectOrder,
@@ -31,6 +34,22 @@ export default function HomeClient() {
   const [railLocked, setRailLocked] = useState<boolean>(false)
   const railContainerRef = useRef<HTMLDivElement | null>(null)
   const showOperator = typeof process !== 'undefined' && Boolean(process.env.NEXT_PUBLIC_SHOW_OPERATOR)
+
+  // Proactive auth modal: prompt unauthenticated users on arrival
+  const [authOpen, setAuthOpen] = useState<boolean>(false)
+  useEffect(() => {
+    let mounted = true
+    supabaseBrowser.auth.getUser().then(({ data }) => {
+      if (!mounted) return
+      const hasUser = !!data?.user
+      setAuthOpen(!hasUser)
+    })
+    const { data: sub } = supabaseBrowser.auth.onAuthStateChange((_event, session) => {
+      const hasUser = !!session?.user
+      setAuthOpen(!hasUser)
+    })
+    return () => { mounted = false; sub.subscription.unsubscribe() }
+  }, [])
 
   const handleStartNew = useCallback(() => {
     setRailExpanded(false)
@@ -106,6 +125,12 @@ export default function HomeClient() {
 
   return (
     <main className="flex min-h-screen gap-4 p-4">
+      <AuthModal
+        open={authOpen}
+        onClose={() => setAuthOpen(false)}
+        onAuthenticated={() => setAuthOpen(false)}
+        title="Sign in to start"
+      />
       <div
         ref={railContainerRef}
         className={`relative h-[calc(100vh-2rem)] ${railExpanded ? 'cursor-default' : 'cursor-ew-resize'}`}
@@ -124,7 +149,7 @@ export default function HomeClient() {
         />
       </div>
       <div className="flex flex-1 min-w-0 gap-4">
-        <OrderScope orderId={orderId}>
+        <OrderScope orderId={orderId} initialStatus={initialStatus ?? null} initialQuote={initialQuote ?? null} initialVersion={initialVersion}>
           <div className="flex-1 min-w-0">
             <Stage
               key={orderId || 'none'}
@@ -140,7 +165,17 @@ export default function HomeClient() {
             loadingSnapshot={loadingSnapshot}
             initialMessages={initialMessages ?? undefined}
             initialStatus={initialStatus ?? undefined}
-            initialAttachments={initialAttachments ?? undefined}
+            initialAttachments={initialAttachments?.map((a: any) => ({
+              assetId: a.asset_id,
+              url: a.url,
+              storageUrl: a.storage_url,
+              expiresAt: a.expires_at,
+              pending: a.pending,
+              label: a.label,
+              name: a.name,
+              size: a.size,
+              contentType: a.content_type,
+            })) ?? undefined}
             onOrderCreated={handleOrderCreated}
             onViewerFocus={handleViewerFocus}
           />
