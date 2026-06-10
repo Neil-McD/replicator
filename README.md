@@ -71,3 +71,4 @@ cd ../worker && python3 -m venv .venv && source .venv/bin/activate && pip instal
 ```
 
 Create `web/.env.local` and `worker/.env` on the Mac (never commit them). Refer to AGENT.md for required keys and paths.
+
