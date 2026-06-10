@@ -19,6 +19,14 @@ Prereqs: Node 18+, Python 3.10+, Supabase project, Stripe secret, Bambu Studio C
 
 Key environment variables are listed in AGENT.md (Section I). Do not commit secrets.
 
+## Project layout
+
+- `app` — Root API/app entrypoints.
+- `web` — Next.js app, UI components, libraries, and browser workers.
+- `worker` — Python worker, support scripts, and worker tests.
+- `scripts` — Helper shell scripts for local development and operations.
+- `supabase` — Database schema and migrations.
+
 ## Deploy/Operate
 
 - Supabase schema/migrations are under `supabase/`. Apply via Supabase CLI or SQL.
@@ -63,4 +71,3 @@ cd ../worker && python3 -m venv .venv && source .venv/bin/activate && pip instal
 ```
 
 Create `web/.env.local` and `worker/.env` on the Mac (never commit them). Refer to AGENT.md for required keys and paths.
-
