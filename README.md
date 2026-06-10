@@ -17,7 +17,7 @@ Prereqs: Node 18+, Python 3.10+, Supabase project, Stripe secret, Bambu Studio C
   - Create `worker/.env` (copy from `worker/.env.example` and fill paths/keys)
   - `python main.py`
 
-Key environment variables are listed in AGENT.md (Section I). Do not commit secrets.
+Key environment variables are listed in AGENTS.md (Section I). Do not commit secrets.
 
 ## Deploy/Operate
 
@@ -62,5 +62,5 @@ cd web && npm install && npm run dev
 cd ../worker && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && python main.py
 ```
 
-Create `web/.env.local` and `worker/.env` on the Mac (never commit them). Refer to AGENT.md for required keys and paths.
+Create `web/.env.local` and `worker/.env` on the Mac (never commit them). Refer to AGENTS.md for required keys and paths.
 
