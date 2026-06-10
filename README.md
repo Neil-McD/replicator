@@ -6,9 +6,18 @@ Minimal, production‑oriented pipeline to: Visualize (T2I), Materialize (Image�
 
 Prereqs: Node 18+, Python 3.10+, Supabase project, Stripe secret, Bambu Studio CLI box for the worker.
 
+## Environment files
+
+Create these local files before running the app:
+
+- `web/.env.local` for the Next.js app.
+- `worker/.env` for the Python worker, copied from `worker/.env.example`.
+
+See `AGENTS.md` for the full environment variable reference.
+
 - Web (Next.js)
   - `cd web && npm install`
-  - Create `web/.env.local` (see AGENT.md variables)
+  - Create `web/.env.local`
   - `npm run dev` → http://localhost:3000
 
 - Worker (Python)
@@ -62,5 +71,4 @@ cd web && npm install && npm run dev
 cd ../worker && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && python main.py
 ```
 
-Create `web/.env.local` and `worker/.env` on the Mac (never commit them). Refer to AGENT.md for required keys and paths.
-
+Create `web/.env.local` and `worker/.env` on the Mac (never commit them). Refer to AGENTS.md for required keys and paths.
