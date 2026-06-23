@@ -26,23 +26,20 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       return NextResponse.json(body, { status })
     }
 
-    // Only allow continuing editing if currently at ready_to_pay
-    if (order.status !== 'ready_to_pay') {
+    // Only allow continuing editing if currently at quoted
+    if (order.status !== 'quoted') {
       return NextResponse.json(
-        { error: 'invalid_status', message: 'Can only continue editing from ready_to_pay status' },
+        { error: 'invalid_status', message: 'Can only continue editing from quoted status' },
         { status: 400 }
       )
     }
 
-    // Set status back to stl_ready, preserving the quote for reference
-    const { error: updateError } = await supabase
-      .from('orders')
-      .update({ status: 'stl_ready' })
-      .eq('id', params.id)
-
-    if (updateError) {
+    // Set status back to materialized via state machine RPC, preserving the quote for reference
+    try {
+      await supabase.rpc('advance_order', { p_order_id: params.id, p_next: 'materialized', p_meta: { source: 'continue_editing' } })
+    } catch (rpcErr: any) {
       return NextResponse.json(
-        { error: 'update_failed', message: 'Failed to update order status' },
+        { error: 'update_failed', message: 'Failed to update order status', detail: rpcErr?.message || null },
         { status: 500 }
       )
     }
@@ -56,7 +53,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       })
     } catch {}
 
-    return NextResponse.json({ ok: true, status: 'stl_ready' })
+    return NextResponse.json({ ok: true, status: 'materialized' })
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 })
   }

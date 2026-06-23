@@ -175,7 +175,7 @@ async function uploadImage(
     try {
       await supabase
         .from('order_events')
-        .insert({ order_id: orderId, phase: 'materializing', message, meta_json })
+        .insert({ order_id: orderId, phase: 'working', message, meta_json })
     } catch {}
     return null
   }
@@ -209,6 +209,51 @@ export async function materializeSelectedImages(options: MaterializeOptions): Pr
   await ensureStorageBucket(bucket)
 
   const initialImages = computeViewRoles(rows)
+
+  // Fast-enqueue: immediately queue an i23d generation task using remote image URLs so the
+  // worker can start without waiting for mirrors to complete. This greatly reduces perceived
+  // latency on providers that serve large images slowly or block mirroring.
+  const FAST_FLAG = (process.env.MATERIALIZE_FAST_ENQUEUE || '1').toLowerCase()
+  const fastEnqueue = ['1', 'true', 'yes', 'on'].includes(FAST_FLAG)
+  const fastReturn = ['1','true','yes','on'].includes((process.env.MATERIALIZE_FAST_RETURN || '0').toLowerCase())
+  if (fastEnqueue && initialImages.length) {
+    const existingTask = await supabase
+      .from('generation_tasks')
+      .select('id')
+      .eq('order_id', orderId)
+      .eq('kind', 'i23d')
+      .in('status', ['queued', 'running'])
+      .limit(1)
+    if (!existingTask.data?.length) {
+      const fallbackViews = initialImages.map((im) => ({ imageId: im.id, assetUrl: im.url, viewRole: im.viewRole || null }))
+      await supabase.from('generation_tasks').insert({
+        order_id: orderId,
+        kind: 'i23d',
+        provider: 'worker',
+        status: 'queued',
+        payload_json: {
+          imageAssetUrls: fallbackViews.map((v) => v.assetUrl),
+          imageIds: fallbackViews.map((v) => v.imageId),
+          imageViews: fallbackViews,
+        },
+      })
+      try {
+        await supabase.rpc('advance_order', { p_order_id: orderId, p_next: 'working', p_meta: { source: 'materialize_fast_enqueue' } })
+      } catch {
+        // best-effort: do not block materialize if RPC temporarily unavailable
+      }
+      try {
+        await supabase.from('order_events').insert({ order_id: orderId, phase: 'working', message: `Queued materialize on ${fallbackViews.length} image(s) (fast enqueue)` })
+      } catch {}
+      if (fastReturn) {
+        const chosenIdFast = initialImages[0]?.id || null
+        if (chosenIdFast) {
+          try { await supabase.from('orders').update({ chosen_image_id: chosenIdFast }).eq('id', orderId) } catch {}
+        }
+        return { uploaded: [], chosenImageId: chosenIdFast, quickMesh: null, angleImages: [] }
+      }
+    }
+  }
   const uploaded: UploadResult[] = []
   for (const im of initialImages) {
     const upload = await uploadImage(supabase, orderId, bucket, im.id, im.url, im.viewRole, im.meta)
@@ -230,7 +275,7 @@ export async function materializeSelectedImages(options: MaterializeOptions): Pr
       )
       await supabase
         .from('order_events')
-        .insert({ order_id: orderId, phase: 'materializing', message: `materialize_fallback_remote:${fallbackViews.length}`, meta_json: { hosts } })
+        .insert({ order_id: orderId, phase: 'working', message: `materialize_fallback_remote:${fallbackViews.length}`, meta_json: { hosts } })
     } catch {}
     const existingTask = await supabase
       .from('generation_tasks')
@@ -252,10 +297,12 @@ export async function materializeSelectedImages(options: MaterializeOptions): Pr
         },
       })
     }
-    await supabase.from('orders').update({ status: 'materializing' }).eq('id', orderId)
+    try {
+      await supabase.rpc('advance_order', { p_order_id: orderId, p_next: 'working', p_meta: { source: 'materialize_fallback_remote' } })
+    } catch {}
     await supabase
       .from('order_events')
-      .insert({ order_id: orderId, phase: 'materializing', message: `Selected ${fallbackViews.length} image(s) (remote fallback)` })
+      .insert({ order_id: orderId, phase: 'working', message: `Selected ${fallbackViews.length} image(s) (remote fallback)` })
     return { uploaded: [], chosenImageId: initialImages[0]?.id || null, quickMesh: null, angleImages: [] }
   }
 
@@ -304,10 +351,12 @@ export async function materializeSelectedImages(options: MaterializeOptions): Pr
     })
   }
 
-  await supabase.from('orders').update({ status: 'materializing' }).eq('id', orderId)
+  try {
+    await supabase.rpc('advance_order', { p_order_id: orderId, p_next: 'working', p_meta: { source: 'materialize' } })
+  } catch {}
   await supabase
     .from('order_events')
-    .insert({ order_id: orderId, phase: 'materializing', message: `Selected ${uploaded.length} image(s)` })
+    .insert({ order_id: orderId, phase: 'working', message: `Selected ${uploaded.length} image(s)` })
 
   let autoAngleUploads: UploadResult[] = []
   if (autoAngles && uploaded[0]) {
