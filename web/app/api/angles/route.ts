@@ -4,6 +4,7 @@ import { getEditProvider } from '@/lib/providers/edit'
 import { mirrorRemoteImageToStorage } from '@/lib/storage'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { transitionOrder } from '@/lib/orderState'
 
 export const runtime = 'nodejs'
 
@@ -56,6 +57,14 @@ export async function POST(req: Request) {
     const DEFAULTS = ['top', 'bottom', 'opposite'] as const
     const requested = (anglesInput.length ? anglesInput : DEFAULTS).filter((k) => ['top','bottom','opposite'].includes(String(k))) as ('top'|'bottom'|'opposite')[]
     if (!requested.length) return NextResponse.json({ error: 'no_angles_requested' }, { status: 400 })
+    await transitionOrder(supabase, {
+      orderId,
+      to: 'visualizing',
+      authority: 'visualize',
+      expectedFrom: ['new', 'await_image_pick', 'generate_failed', 'repair_failed', 'slice_failed', 'needs_review'],
+      idempotencyKey: `angles:start:${orderId}:${imageId}:${requested.join(',')}`,
+      meta: { parent_image_id: imageId, angles: requested },
+    })
 
     // Simple per-parent cooldown to avoid spamming provider on rapid clicks
     const cooldownS = Math.max(1, Number(process.env.ANGLES_COOLDOWN_S || 8))
@@ -152,7 +161,14 @@ export async function POST(req: Request) {
       .from('chat_messages')
       .insert({ order_id: orderId, role: 'assistant', type: 'card.images', content_json: { group: 'angles', parent_image_id: imageId, images, n: images.length } })
     await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: 'More angles ready. You can materialize them all or pick one.' } })
-    await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+    await transitionOrder(supabase, {
+      orderId,
+      to: 'await_image_pick',
+      authority: 'visualize',
+      expectedFrom: 'visualizing',
+      idempotencyKey: `angles:complete:${orderId}:${(inserted || []).map((row: any) => row.id).join(',')}`,
+      meta: { parent_image_id: imageId, image_count: images.length },
+    })
     try {
       await supabase.from('order_events').insert({ order_id: orderId, phase: 'visualizing', message: 'Angles generated', meta_json: { parent_image_id: imageId, n: images.length, duration_ms: Date.now() - t0 } })
     } catch {}

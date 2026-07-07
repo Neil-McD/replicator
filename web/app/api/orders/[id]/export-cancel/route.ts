@@ -5,7 +5,7 @@ import { requireAuthContext } from '@/lib/apiAuth'
 export const runtime = 'nodejs'
 
 // POST /api/orders/:id/export-cancel
-// Cancels any pending/processing export jobs for this order and nudges status back to an editable state.
+// Cancels any pending/processing export jobs for this order without mutating core order state.
 export async function POST(_req: Request, { params }: { params: { id: string } }) {
   const orderId = params.id
   try {
@@ -34,7 +34,6 @@ export async function POST(_req: Request, { params }: { params: { id: string } }
       .eq('order_id', orderId)
       .in('status', ['pending', 'processing'])
 
-    // If we already have a printable STL, move status to stl_ready; otherwise leave as-is
     const { data: assets } = await supabase
       .from('assets')
       .select('id,kind')
@@ -43,9 +42,6 @@ export async function POST(_req: Request, { params }: { params: { id: string } }
       .order('created_at', { ascending: false })
       .limit(1)
     const printable = (assets || []).length > 0
-    if (printable) {
-      await supabase.from('orders').update({ status: 'stl_ready' }).eq('id', orderId)
-    }
     await supabase.from('order_events').insert({
       order_id: orderId,
       phase: 'export_cancelled',
@@ -56,4 +52,3 @@ export async function POST(_req: Request, { params }: { params: { id: string } }
     return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 })
   }
 }
-

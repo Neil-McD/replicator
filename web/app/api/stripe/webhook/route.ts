@@ -2,6 +2,7 @@ import { headers } from 'next/headers'
 import { NextResponse } from 'next/server'
 import Stripe from 'stripe'
 import { createAdminClient } from '@/lib/supabaseAdmin'
+import { transitionOrder } from '@/lib/orderState'
 
 export const runtime = 'nodejs'
 
@@ -19,19 +20,43 @@ export async function POST(req: Request) {
       const order_id = session.metadata?.order_id
       if (order_id) {
         const supabase = createAdminClient()
+        const { data: orderRow, error: orderErr } = await supabase
+          .from('orders')
+          .select('id,status,quote_json')
+          .eq('id', order_id)
+          .single()
+        if (orderErr || !orderRow) throw orderErr || new Error('order_not_found')
+        const expectedAmount = Number((orderRow.quote_json as any)?.total_cents ?? (orderRow.quote_json as any)?.price_cents)
+        const paidAmount = Number(session.amount_total || 0)
+        if (orderRow.status !== 'ready_to_pay' && orderRow.status !== 'paid') {
+          throw new Error(`invalid_order_status:${orderRow.status}`)
+        }
+        if (Number.isFinite(expectedAmount) && expectedAmount > 0 && expectedAmount !== paidAmount) {
+          throw new Error('payment_amount_mismatch')
+        }
         await supabase
           .from('payments')
-          .insert({ order_id, provider_ref: session.id, amount_cents: session.amount_total || 0, status: 'succeeded' })
+          .upsert({ order_id, provider_ref: session.id, amount_cents: paidAmount, status: 'succeeded' }, { onConflict: 'provider_ref' })
+        await transitionOrder(supabase, {
+          orderId: order_id,
+          to: 'paid',
+          authority: 'stripe',
+          expectedFrom: ['ready_to_pay', 'paid'],
+          idempotencyKey: `stripe:checkout.session.completed:${session.id}`,
+          meta: { provider_ref: session.id, amount_cents: paidAmount },
+        })
         await supabase
           .from('orders')
-          .update({ status: 'dispatching', payment_status: 'paid' })
+          .update({ payment_status: 'paid' })
           .eq('id', order_id)
         await supabase
           .from('order_events')
           .insert([
             { order_id, phase: 'paid', message: 'Stripe checkout completed' },
-            { order_id, phase: 'dispatching', message: 'Preparing dispatch to printer' },
           ])
+        await supabase
+          .from('chat_messages')
+          .insert({ order_id, role: 'assistant', type: 'text', content_json: { text: 'Authorized. Fabrication is ready for operator dispatch.' } })
       }
     }
     return new NextResponse(null, { status: 200 })

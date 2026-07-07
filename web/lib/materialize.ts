@@ -5,6 +5,7 @@ import { attachQuickMesh } from '@/lib/providers/i23d'
 import { getEditProvider } from '@/lib/providers/edit'
 import { mirrorRemoteImageToStorage } from '@/lib/storage'
 import { robustImageFetch } from '@/lib/httpFetch'
+import { transitionOrder } from '@/lib/orderState'
 
 type UploadResult = { id: string; assetUrl: string; viewRole?: string | null }
 
@@ -88,7 +89,11 @@ async function fetchImages(
     .eq('order_id', orderId)
     .in('id', ids)
   if (error) throw error
-  return data || []
+  const rows = data || []
+  const found = new Set(rows.map((row: any) => row.id as string))
+  const missing = ids.filter((id) => !found.has(id))
+  if (missing.length) throw new Error('image_not_found')
+  return rows
 }
 
 function includeAngleParents(rows: any[]): Set<string> {
@@ -240,11 +245,13 @@ export async function materializeSelectedImages(options: MaterializeOptions): Pr
       .in('status', ['queued', 'running'])
       .limit(1)
     if (!existingTask.data?.length) {
+      const taskKey = `i23d:${orderId}:${fallbackViews.map((v) => v.imageId).sort().join(',')}:worker`
       await supabase.from('generation_tasks').insert({
         order_id: orderId,
         kind: 'i23d',
         provider: 'worker',
         status: 'queued',
+        idempotency_key: taskKey,
         payload_json: {
           imageAssetUrls: fallbackViews.map((v) => v.assetUrl),
           imageIds: fallbackViews.map((v) => v.imageId),
@@ -252,7 +259,14 @@ export async function materializeSelectedImages(options: MaterializeOptions): Pr
         },
       })
     }
-    await supabase.from('orders').update({ status: 'materializing' }).eq('id', orderId)
+    await transitionOrder(supabase, {
+      orderId,
+      to: 'materializing',
+      authority: 'materialize',
+      expectedFrom: ['await_image_pick', 'materializing'],
+      idempotencyKey: `materialize:${orderId}:${fallbackViews.map((v) => v.imageId).sort().join(',')}:worker`,
+      meta: { selected_image_ids: fallbackViews.map((v) => v.imageId), remote_fallback: true },
+    })
     await supabase
       .from('order_events')
       .insert({ order_id: orderId, phase: 'materializing', message: `Selected ${fallbackViews.length} image(s) (remote fallback)` })
@@ -291,11 +305,13 @@ export async function materializeSelectedImages(options: MaterializeOptions): Pr
     .in('status', ['queued', 'running'])
     .limit(1)
   if (!existingTask.data?.length) {
+    const taskKey = `i23d:${orderId}:${uploaded.map((u) => u.id).sort().join(',')}:worker`
     await supabase.from('generation_tasks').insert({
       order_id: orderId,
       kind: 'i23d',
       provider: 'worker',
       status: 'queued',
+      idempotency_key: taskKey,
       payload_json: {
         imageAssetUrls: uploaded.map((u) => u.assetUrl),
         imageIds: uploaded.map((u) => u.id),
@@ -304,7 +320,14 @@ export async function materializeSelectedImages(options: MaterializeOptions): Pr
     })
   }
 
-  await supabase.from('orders').update({ status: 'materializing' }).eq('id', orderId)
+  await transitionOrder(supabase, {
+    orderId,
+    to: 'materializing',
+    authority: 'materialize',
+    expectedFrom: ['await_image_pick', 'materializing'],
+    idempotencyKey: `materialize:${orderId}:${uploaded.map((u) => u.id).sort().join(',')}:worker`,
+    meta: { selected_image_ids: uploaded.map((u) => u.id) },
+  })
   await supabase
     .from('order_events')
     .insert({ order_id: orderId, phase: 'materializing', message: `Selected ${uploaded.length} image(s)` })

@@ -6,11 +6,13 @@ class StubSupabase {
   tables: Record<string, any>
   updates: Array<{ table: string; payload: any; filters: Array<{ column: string; value: any }> }>
   inserts: Array<{ table: string; payload: any }>
+  upserts: Array<{ table: string; payload: any; options?: any }>
 
   constructor(tables: Record<string, any>) {
     this.tables = tables
     this.updates = []
     this.inserts = []
+    this.upserts = []
   }
 
   from(table: string) {
@@ -46,6 +48,11 @@ class StubSupabase {
 
       insert(payload: any) {
         self.inserts.push({ table, payload })
+        return Promise.resolve({ data: null, error: null })
+      }
+
+      upsert(payload: any, options?: any) {
+        self.upserts.push({ table, payload, options })
         return Promise.resolve({ data: null, error: null })
       }
 
@@ -98,14 +105,15 @@ test('handleStoreRequest queues export when only repaired STL exists', async () 
   const auth = { isAdmin: false, user: { id: 'user-1' } }
   const body = {}
 
-  const response = await handleStoreRequest({ supabase, auth, orderId, body })
+  const response = await handleStoreRequest({ supabase: supabase as any, auth, orderId, body })
   assert.equal(response.status, 202)
   const payload = await response.json()
   assert.equal(payload.status, 'pending_export')
 
-  assert.equal(supabase.updates.length, 1)
-  assert.equal(supabase.updates[0].table, 'orders')
-  assert.equal(supabase.updates[0].payload.status, 'exporting')
+  assert.equal(supabase.updates.filter((entry) => entry.table === 'orders').length, 0)
+  assert.equal(supabase.upserts.length, 1)
+  assert.equal(supabase.upserts[0].table, 'export_jobs')
+  assert.equal(supabase.upserts[0].payload.status, 'pending')
 
   const insertedTables = supabase.inserts.map((entry) => entry.table)
   assert.deepEqual(insertedTables.sort(), ['chat_messages', 'order_events'])
@@ -132,7 +140,7 @@ test('handleStoreRequest rejects when no repaired STL is available', async () =>
   const auth = { isAdmin: false, user: { id: 'user-1' } }
   const body = {}
 
-  const response = await handleStoreRequest({ supabase, auth, orderId, body })
+  const response = await handleStoreRequest({ supabase: supabase as any, auth, orderId, body })
   assert.equal(response.status, 409)
   const payload = await response.json()
   assert.equal(payload.error, 'sized_asset_missing')

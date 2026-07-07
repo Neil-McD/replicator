@@ -129,25 +129,30 @@ export async function handleStoreRequest(options: {
   })()
   if (!sizedAsset) {
     if (latestRepaired) {
-      const currentStatus = typeof orderRow.status === 'string' ? orderRow.status : null
-      if (currentStatus !== 'exporting') {
-        try {
-          await supabase.from('orders').update({ status: 'exporting' }).eq('id', orderId)
-          await supabase.from('order_events').insert({
-            order_id: orderId,
-            phase: 'export_requested',
-            message: 'Catalog requested sized STL export',
-          })
-          await supabase.from('chat_messages').insert({
-            order_id: orderId,
-            role: 'assistant',
-            type: 'text',
-            content_json: { text: 'Sizing the mesh for your catalog listing — give me a moment.' },
-          })
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          console.warn('[orders/store] failed to enqueue export request', msg)
-        }
+      try {
+        await supabase.from('export_jobs').upsert({
+          order_id: orderId,
+          status: 'pending',
+          target_max_dim_mm: Number.isFinite(requestedTarget) ? requestedTarget : null,
+          target_tolerance_mm: tolerance,
+          requested_by: auth.user?.id ?? null,
+          idempotency_key: `catalog-export:${orderId}:${Number.isFinite(requestedTarget) ? requestedTarget : 'native'}:${tolerance}`,
+          meta_json: { source: 'catalog_publish', requested_at: new Date().toISOString() },
+        }, { onConflict: 'order_id,job_type,idempotency_key' })
+        await supabase.from('order_events').insert({
+          order_id: orderId,
+          phase: 'export_requested',
+          message: 'Catalog requested sized STL export',
+        })
+        await supabase.from('chat_messages').insert({
+          order_id: orderId,
+          role: 'assistant',
+          type: 'text',
+          content_json: { text: 'Sizing the mesh for your catalog listing — give me a moment.' },
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.warn('[orders/store] failed to enqueue export request', msg)
       }
       return NextResponse.json({
         error: 'sized_asset_pending',

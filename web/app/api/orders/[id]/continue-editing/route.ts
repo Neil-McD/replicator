@@ -34,19 +34,6 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       )
     }
 
-    // Set status back to stl_ready, preserving the quote for reference
-    const { error: updateError } = await supabase
-      .from('orders')
-      .update({ status: 'stl_ready' })
-      .eq('id', params.id)
-
-    if (updateError) {
-      return NextResponse.json(
-        { error: 'update_failed', message: 'Failed to update order status' },
-        { status: 500 }
-      )
-    }
-
     // Log the event
     try {
       await supabase.from('order_events').insert({
@@ -56,7 +43,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       })
     } catch {}
 
-    return NextResponse.json({ ok: true, status: 'stl_ready' })
+    return NextResponse.json({ ok: true, status: order.status })
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 })
   }

@@ -3,6 +3,7 @@ import { createAdminClient, signedUrlOrDirect, ensureStorageBucket, signedUrlWit
 import { getEditProvider } from '@/lib/providers/edit'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { transitionOrder } from '@/lib/orderState'
 
 export const runtime = 'nodejs'
 
@@ -66,6 +67,14 @@ export async function POST(req: Request) {
     if (imgErr || !imgRow) return NextResponse.json({ error: 'image_not_found' }, { status: 404 })
     let inputUrl = imgRow.url
     try { inputUrl = await signedUrlOrDirect(imgRow.url) } catch {}
+    await transitionOrder(supabase, {
+      orderId,
+      to: 'visualizing',
+      authority: 'visualize',
+      expectedFrom: ['new', 'await_image_pick', 'generate_failed', 'repair_failed', 'slice_failed', 'needs_review'],
+      idempotencyKey: `edit:start:${orderId}:${imageId}:${prompt}:${n}`,
+      meta: { parent_image_id: imgRow.id, n },
+    })
     const editor = getEditProvider(process.env.EDIT_PROVIDER)
     const { imageUrls, description } = await editor.editImage({ imageUrl: inputUrl, prompt, n, format })
     if (!imageUrls || !imageUrls.length) return NextResponse.json({ error: 'edit_returned_no_images' }, { status: 500 })
@@ -96,7 +105,14 @@ export async function POST(req: Request) {
     const rows = mirrored.map((it) => ({ order_id: orderId, kind: 'candidate', url: it.url, meta_json: { parent_image_id: imgRow.id, edit_prompt: prompt, provider: 'nano-banana', description: description || null } }))
     const { data: inserted, error } = await supabase.from('images').insert(rows).select('id,url')
     if (error) throw error
-    await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+    await transitionOrder(supabase, {
+      orderId,
+      to: 'await_image_pick',
+      authority: 'visualize',
+      expectedFrom: 'visualizing',
+      idempotencyKey: `edit:complete:${orderId}:${(inserted || []).map((row: any) => row.id).join(',')}`,
+      meta: { image_count: inserted?.length || 0 },
+    })
     await supabase.from('order_events').insert({ order_id: orderId, phase: 'visualizing', message: 'Edited concept', meta_json: { parent_image_id: imgRow.id, n } })
     const imagesRaw = (inserted || []).slice(0, n)
     const signedMap = new Map<string, { url: string; storage_url: string; expires_at: number | null }>()

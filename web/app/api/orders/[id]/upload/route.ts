@@ -59,9 +59,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       },
     })
     console.log('[api/orders/:id/upload POST] saved asset kind=', kind, 'path=', path)
-    // Nudge the worker: ensure the order is in a claimable state
     try {
-      await supabase.from('orders').update({ status: 'new' }).eq('id', orderId)
       await supabase.from('order_events').insert({ order_id: orderId, phase: 'upload', message: `uploaded ${kind}` })
     } catch {}
     return NextResponse.json({ ok: true })

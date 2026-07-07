@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import Stripe from 'stripe'
 import { createAdminClient } from '@/lib/supabaseAdmin'
+import { hasSliceDerivedQuote, requireAssetKinds } from '@/lib/orderState'
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion: '2023-10-16' })
 
@@ -19,7 +20,13 @@ export async function POST(req: Request) {
     if (order.status !== 'ready_to_pay') return NextResponse.json({ error: 'Order not ready for payment' }, { status: 400 })
     const quote = order.quote_json as any
     const priceCents = quote?.total_cents ?? quote?.price_cents
+    if (!hasSliceDerivedQuote(quote)) return NextResponse.json({ error: 'Missing slice-derived quote metrics' }, { status: 400 })
     if (!priceCents) return NextResponse.json({ error: 'Missing price on order' }, { status: 400 })
+    try {
+      await requireAssetKinds(supabase, order_id, ['three_mf', 'gcode', 'slicedata', 'slicer_preview_png'])
+    } catch (gateErr: any) {
+      return NextResponse.json({ error: 'missing_printable_artifacts', missing: gateErr?.missing || [] }, { status: 400 })
+    }
     const maxQty = Math.max(1, Number(process.env.CHECKOUT_MAX_QTY || 20))
     const quantity = Math.min(maxQty, Math.max(1, Number(rawQty || 1)))
 

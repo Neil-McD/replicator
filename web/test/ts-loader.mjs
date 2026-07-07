@@ -7,6 +7,9 @@ const testDir = path.dirname(fileURLToPath(import.meta.url))
 const webRoot = path.resolve(testDir, '..')
 
 export async function resolve(specifier, context, defaultResolve) {
+  if (specifier === './test/ts-loader.mjs') {
+    return { url: pathToFileURL(path.join(webRoot, 'test', 'ts-loader.mjs')).href, shortCircuit: true }
+  }
   if (specifier.startsWith('@/')) {
     const target = path.join(webRoot, specifier.slice(2))
     const withExt = await resolveWithExtensions(target)
