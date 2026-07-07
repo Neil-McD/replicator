@@ -1665,8 +1665,12 @@ def _order_cancelled(order_id: Optional[str]) -> bool:
 
 
 def _skip_if_cancelled(order_id: Optional[str], stage: str) -> bool:
-    if _order_cancelled(order_id):
-        # If user explicitly queued an Image→3D task, honor that over a stale soft‑cancel during generate.
+    status_val, flag = _fetch_order_state(order_id)
+    if status_val and status_val.lower() == "cancelled":
+        log(f"[cancel] Order {order_id} is cancelled before {stage}; skipping")
+        return True
+    if flag:
+        # If user explicitly queued an Image→3D task, honor that over a stale soft-cancel during generate.
         if stage in ("generate", "generating", "post_generate") and _has_active_i23d_task(order_id):
             log(
                 f"[cancel] Soft-cancel ignored for {stage} due to active i23D task",

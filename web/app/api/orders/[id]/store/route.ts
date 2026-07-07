@@ -5,6 +5,7 @@ import { createAdminClient, parseSupabaseUrl, signedUrlOrDirect } from '@/lib/su
 import { requireAuthContext } from '@/lib/apiAuth'
 import { ensureOrgForUser } from '@/lib/orgs'
 import { parseDataUrl, toNumber } from '@/lib/storeUtils'
+import { hasSliceDerivedQuote } from '@/lib/orderState'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -13,6 +14,8 @@ const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET ?? 'artifacts'
 const DEFAULT_PRICE_CENTS = Number(process.env.DEFAULT_STORE_PRICE_CENTS || 2800)
 const DEFAULT_COST_CENTS = Number(process.env.DEFAULT_STORE_COST_CENTS || 1250)
 const SIZE_TOLERANCE_MM = Math.max(0.1, Number(process.env.STORE_SIZE_TOLERANCE_MM || 0.75))
+const CATALOG_READY_STATUSES = new Set(['ready_to_pay', 'paid', 'dispatching', 'printing', 'done'])
+const REQUIRED_SLICE_ARTIFACTS = ['three_mf', 'gcode', 'slicedata', 'slicer_preview_png'] as const
 
 type StoreAuthContext = {
   isAdmin: boolean
@@ -42,6 +45,19 @@ function pickSizedAsset(assets: any[], targetMm?: number | null, tolerance = SIZ
     return asset
   }
   return null
+}
+
+function latestAssetByKind(assets: any[], kind: string) {
+  for (let i = assets.length - 1; i >= 0; i -= 1) {
+    const row = assets[i]
+    if (row && row.kind === kind) return row
+  }
+  return null
+}
+
+function missingSliceArtifacts(assets: any[]) {
+  const kinds = new Set(assets.map((asset) => String(asset?.kind || '')))
+  return REQUIRED_SLICE_ARTIFACTS.filter((kind) => !kinds.has(kind))
 }
 
 async function copyOrDownloadAsset(
@@ -120,13 +136,29 @@ export async function handleStoreRequest(options: {
 
   const assetList = Array.isArray(assets) ? assets : []
   const sizedAsset = pickSizedAsset(assetList, requestedTarget, tolerance)
-  const latestRepaired = (() => {
-    for (let i = assetList.length - 1; i >= 0; i -= 1) {
-      const row = assetList[i]
-      if (row && row.kind === 'repaired_stl') return row
-    }
-    return null
-  })()
+  const latestRepaired = latestAssetByKind(assetList, 'repaired_stl')
+  const quote = orderRow.quote_json || {}
+  const missingSlice = missingSliceArtifacts(assetList)
+  if (!CATALOG_READY_STATUSES.has(String(orderRow.status || ''))) {
+    return NextResponse.json({
+      error: 'slice_boundary_required',
+      message: 'Catalog publishing is available after slicing and quote generation.',
+    }, { status: 409 })
+  }
+  if (!hasSliceDerivedQuote(quote)) {
+    return NextResponse.json({
+      error: 'slice_quote_required',
+      message: 'Catalog publishing requires a slice-derived quote with minutes and grams.',
+    }, { status: 409 })
+  }
+  if (missingSlice.length) {
+    return NextResponse.json({
+      error: 'slice_artifacts_required',
+      missing: missingSlice,
+      message: 'Catalog publishing requires completed slice artifacts.',
+    }, { status: 409 })
+  }
+
   if (!sizedAsset) {
     if (latestRepaired) {
       try {
@@ -170,7 +202,6 @@ export async function handleStoreRequest(options: {
   const targetStored = Number(sizedMeta?.target_max_dim_mm ?? sizedMeta?.target_max_dim ?? sizedMeta?.target)
   const effectiveTarget = Number.isFinite(targetStored) ? Number(targetStored) : (Number.isFinite(requestedTarget) ? Number(requestedTarget) : null)
 
-  const quote = orderRow.quote_json || {}
   const priceCents = Number.isFinite(priceOverride) ? Math.max(0, Math.round(priceOverride)) : toNumber(quote?.price_cents, DEFAULT_PRICE_CENTS)
   const costCents = Number.isFinite(costOverride) ? Math.max(0, Math.round(costOverride)) : toNumber(quote?.cost_cents, DEFAULT_COST_CENTS)
 

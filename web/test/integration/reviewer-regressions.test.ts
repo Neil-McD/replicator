@@ -64,3 +64,25 @@ test('worker status transitions use deterministic idempotency keys, not timestam
   assert.match(body, /worker:\{order_id\}:\{current_status or 'unknown'\}:\{target_status\}/)
   assert.match(body, /expected_from=\[current_status\] if current_status else None/)
 })
+
+test('cancel route uses canonical transition instead of soft-only cancellation', () => {
+  const route = readRepoFile('web/app/api/orders/[id]/cancel/route.ts')
+
+  assert.match(route, /transitionOrder\(supabase,\s*\{/)
+  assert.match(route, /to:\s*'cancelled'/)
+  assert.match(route, /authority:\s*'user'/)
+  assert.match(route, /phase:\s*'cancelled'/)
+  assert.doesNotMatch(route, /forcefully changing the user-visible status to 'cancelled'/)
+})
+
+test('worker cannot ignore canonical cancelled status for active i23d tasks', () => {
+  const worker = readRepoFile('worker/main.py')
+  const start = worker.indexOf('def _skip_if_cancelled(')
+  const end = worker.indexOf('\ndef attach_asset', start)
+  assert.ok(start >= 0 && end > start, '_skip_if_cancelled body exists')
+  const body = worker.slice(start, end)
+
+  assert.match(body, /status_val,\s*flag\s*=\s*_fetch_order_state\(order_id\)/)
+  assert.match(body, /status_val and status_val\.lower\(\) == "cancelled"[\s\S]*return True/)
+  assert.match(body, /if flag:[\s\S]*_has_active_i23d_task\(order_id\)/)
+})
