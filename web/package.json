@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "test": "node --loader ./test/ts-loader.mjs --test test/integration/store-flow.test.ts test/integration/order-state.test.ts"
+    "test": "node --loader ./test/ts-loader.mjs --test test/integration/store-flow.test.ts test/integration/order-state.test.ts test/integration/reviewer-regressions.test.ts"
   },
   "dependencies": {
     "next": "14.2.5",

@@ -674,7 +674,9 @@ create trigger trg_orders_touch_updated
 before update on public.orders
 for each row execute procedure public.touch_updated_at();
 
--- Claim-next-order function (security definer) to atomically lock one job
+-- Legacy claim-next-order compatibility shim.
+-- MVP-critical worker claims must use job-specific RPCs such as claim_i23d_task,
+-- which transition through public.transition_order and write order_transitions.
 create or replace function public.claim_next_order(p_worker_id uuid)
 returns public.orders
 language plpgsql
@@ -684,16 +686,7 @@ as $$
 declare
   claimed public.orders;
 begin
-  update public.orders o
-  set status = 'generating', worker_id = p_worker_id, locked_at = now(), status_updated_at = now()
-  where o.id = (
-    select id from public.orders
-    where status = 'new'
-    order by created_at asc
-    for update skip locked
-    limit 1
-  )
-  returning * into claimed;
+  claimed := null;
   return claimed;
 end;
 $$;

@@ -139,6 +139,22 @@ create unique index if not exists payments_provider_ref_unique
   on public.payments(provider_ref)
   where provider_ref is not null;
 
+create or replace function public.claim_next_order(p_worker_id uuid)
+returns public.orders
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  claimed public.orders;
+begin
+  -- Compatibility shim only. MVP-critical claims must use job-specific RPCs
+  -- that call transition_order and create order_transitions audit records.
+  claimed := null;
+  return claimed;
+end;
+$$;
+
 create or replace function public.transition_order(
   p_order_id uuid,
   p_to_status public.order_status,

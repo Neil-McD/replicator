@@ -1437,8 +1437,7 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
 
     Priority:
     1) Orders with a queued i23d generation_task (created by /api/materialize)
-    2) Orders with status='new' that have at least one 'upload_image' asset
-    3) (Last resort) Old behavior via RPC or first 'new' order
+    2) Orders already in worker-owned canonical stages such as slicing
     """
     _claim_backoff_wait()
     # 0) Prefer queued i23d tasks via atomic RPC
@@ -1453,30 +1452,9 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
     except Exception as exc:
         _claim_backoff_register_failure(exc)
 
-    # 1) Prefer queued i23d tasks
-    try:
-        tasks = supabase_get("generation_tasks", {"status": "eq.queued", "kind": "eq.i23d", "order": "created_at.asc", "limit": 1})
-        if tasks:
-            t = tasks[0]
-            oid = t.get("order_id")
-            if oid:
-                # Mark order as generating and task as running
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
-                try:
-                    supabase_patch(
-                        "generation_tasks",
-                        {"id": f"eq.{t['id']}"},
-                        {"status": "running", "worker_id": WORKER_ID, "claimed_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
-                    )
-                except Exception:
-                    pass
-                # Fetch fresh order row
-                rows = supabase_get("orders", {"id": f"eq.{oid}", "limit": 1})
-                if rows:
-                    _claim_backoff_reset()
-                    return rows[0]
-    except Exception:
-        pass
+    # 1) Do not manually claim queued i23d tasks here. claim_i23d_task is the
+    # only valid i23d claim path because it atomically marks the task running
+    # and transitions materializing -> generating through transition_order.
 
     # 2) Orders explicitly marked for slicing (user requested quote)
     try:
@@ -1517,47 +1495,6 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
-    # 3) Orders with user-uploaded assets present (image or 3D model)
-    try:
-        # Consider up to N recent 'new' orders to avoid scanning entire table
-        candidates = supabase_get("orders", {"status": "eq.new", "order": "created_at.asc", "limit": 25}) or []
-        for o in candidates:
-            oid = o.get("id")
-            try:
-                ups = list_uploads(oid)
-            except Exception:
-                ups = []
-            has_image = any((u.get("kind") == "upload_image") for u in ups)
-            has_model = any((u.get("kind") in ("upload_stl","upload_obj","upload_glb")) for u in ups)
-            if has_image or has_model:
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
-                _claim_backoff_reset()
-                return o
-    except Exception:
-        pass
-
-    # 4) Fallback: atomic RPC (if present) — only accept if order has assets we can use
-    try:
-        claimed = supabase_rpc("claim_next_order", {"p_worker_id": WORKER_ID})
-        if claimed and isinstance(claimed, dict) and claimed.get("id"):
-            oid = claimed.get("id")
-            ups = []
-            try:
-                ups = list_uploads(oid)
-            except Exception:
-                ups = []
-            has_model = any(u.get("kind") in ("upload_stl","upload_obj","upload_glb") for u in ups)
-            has_image = any(u.get("kind") == "upload_image" for u in ups)
-            if has_model or has_image:
-                _claim_backoff_reset()
-                return claimed
-            # No useful assets — set back to new and skip
-            try:
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"worker_id": None, "locked_at": None})
-            except Exception:
-                pass
-    except Exception:
-        pass
     # No suitable orders
     return None
 
@@ -1568,14 +1505,23 @@ def set_status(order_id: str, status: str):
         log(f"[status] skipped legacy core status {target_status} for order {order_id}; use job tables/artifacts instead")
         return
     try:
+        current_status = None
+        try:
+            rows = supabase_get("orders", {"id": f"eq.{order_id}", "select": "status", "limit": 1}) or []
+            if rows:
+                current_status = rows[0].get("status")
+        except Exception:
+            current_status = None
+        idempotency_key = f"worker:{order_id}:{current_status or 'unknown'}:{target_status}"
         supabase_rpc(
             "transition_order",
             transition_payload(
                 order_id=order_id,
                 to_status=target_status,
                 authority="worker",
-                idempotency_key=f"worker:{order_id}:{target_status}:{int(time.time())}",
-                meta_json={"source": "worker.set_status"},
+                expected_from=[current_status] if current_status else None,
+                idempotency_key=idempotency_key,
+                meta_json={"source": "worker.set_status", "from_status": current_status},
             ),
         )
     except Exception as exc:
