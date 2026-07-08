@@ -10,7 +10,7 @@ export const tools = [
       required: ['prompt'],
       properties: {
         prompt: { type: 'string' },
-        n: { type: 'integer', minimum: 1, maximum: 2 },
+        n: { type: 'integer', minimum: 1, maximum: 6 },
         style: { enum: ['figurine', 'mechanical', 'organic'] },
       },
     },

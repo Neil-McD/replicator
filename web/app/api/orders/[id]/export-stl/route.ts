@@ -19,8 +19,8 @@ export const runtime = 'nodejs'
 
 // POST /api/orders/:id/export-stl
 // Body: { target_max_dim_mm?: number }
-// Behavior: records (or updates) a transform and sets status='exporting'
-// so the worker creates a sized print‑ready STL (repaired_sized_stl).
+// Behavior: records (or updates) a transform and queues an export job for the
+// worker to create a sized print-ready STL (repaired_sized_stl).
 export async function POST(req: Request, { params }: { params: { id: string } }) {
   const orderId = params.id
   try {
@@ -124,7 +124,6 @@ export async function POST(req: Request, { params }: { params: { id: string } })
 
     const succeededJob = jobs.find((job: any) => String(job.status || '').toLowerCase() === 'succeeded' && job.asset_id && approxMatch(normalizeTarget(job.target_max_dim_mm), target, tolerance))
     if (succeededJob) {
-      await supabase.from('orders').update({ status: 'stl_ready' }).eq('id', orderId)
       return NextResponse.json({ ok: true, jobId: succeededJob.id, status: succeededJob.status, reused: true, assetId: succeededJob.asset_id })
     }
 
@@ -135,6 +134,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       target_tolerance_mm: tolerance,
       requested_by: auth.user?.id ?? null,
       transform_asset_id: transformAssetId,
+      idempotency_key: `export-stl:${orderId}:${target ?? 'native'}:${tolerance}`,
       meta_json: { source: 'stage', requested_at: new Date().toISOString() },
     }
 
@@ -156,7 +156,6 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       throw jobErr || new Error('failed_to_enqueue_export_job')
     }
 
-    await supabase.from('orders').update({ status: 'exporting' }).eq('id', orderId)
     await supabase.from('order_events').insert({
       order_id: orderId,
       phase: 'export_stl',

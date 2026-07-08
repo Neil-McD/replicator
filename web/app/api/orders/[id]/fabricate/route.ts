@@ -23,19 +23,12 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       return NextResponse.json(body, { status })
     }
     const status = typeof order.status === 'string' ? order.status : null
-    const terminalStates = new Set(['repairing','slicing','stl_ready','ready_to_pay','paid','dispatching','printing'])
-    if (status === 'fabrication_requested') {
-      return NextResponse.json({ ok: true, status })
-    }
+    const terminalStates = new Set(['repairing','slicing','ready_to_pay','paid','dispatching','printing'])
     if (status && terminalStates.has(status)) {
       return NextResponse.json({ ok: true, status })
     }
-    await supabase.from('orders').update({ status: 'fabrication_requested', worker_id: null, locked_at: null }).eq('id', orderId)
-    await supabase.from('order_events').insert({ order_id: orderId, phase: 'fabrication_requested', message: 'User requested fabrication' })
-    try {
-      await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: 'On it — stabilizing the mesh for a print-ready quote.' } })
-    } catch { /* no-op */ }
-    return NextResponse.json({ ok: true })
+    await supabase.from('order_events').insert({ order_id: orderId, phase: 'fabricate_rejected', message: 'Deprecated fabricate route cannot mutate core status' })
+    return NextResponse.json({ error: 'fabricate_route_disabled', message: 'Select a concept to materialize, then the worker will stabilize and slice it.' }, { status: 409 })
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 })
   }

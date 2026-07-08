@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { createAdminClient } from '@/lib/supabaseAdmin'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { transitionOrder } from '@/lib/orderState'
 
 export const runtime = 'nodejs'
 
@@ -19,7 +20,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     }
     const supabase = createAdminClient()
     try {
-      await requireOrderAccess(supabase, orderId, auth, 'id,user_id')
+      await requireOrderAccess(supabase, orderId, auth, 'id,user_id,status')
     } catch (error: any) {
       const { status, body } = handleOrderAccessError(error)
       return NextResponse.json(body, { status })
@@ -83,7 +84,14 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     }
 
     // Update order status to slicing (for backward compat with existing UI)
-    await supabase.from('orders').update({ status: 'slicing' }).eq('id', orderId)
+    await transitionOrder(supabase, {
+      orderId,
+      to: 'slicing',
+      authority: 'worker',
+      expectedFrom: ['repairing', 'slice_failed', 'slicing'],
+      idempotencyKey: `slice:queue:${orderId}:${jobRow.id}`,
+      meta: { job_id: jobRow.id, source: 'manual_retry' },
+    })
 
     await supabase
       .from('order_events')
@@ -99,4 +107,3 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 })
   }
 }
-

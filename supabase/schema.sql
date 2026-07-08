@@ -411,6 +411,32 @@ drop policy if exists audit_log_select_org on public.audit_log;
 create policy audit_log_select_org on public.audit_log for select using (org_id = public.current_org_id());
 
 
+do $$
+begin
+  if not exists (select 1 from pg_type where typname = 'order_status') then
+    create type public.order_status as enum (
+      'new',
+      'visualizing',
+      'await_image_pick',
+      'materializing',
+      'generating',
+      'repairing',
+      'slicing',
+      'ready_to_pay',
+      'paid',
+      'dispatching',
+      'printing',
+      'done',
+      'needs_review',
+      'generate_failed',
+      'repair_failed',
+      'slice_failed',
+      'dispatch_failed',
+      'cancelled'
+    );
+  end if;
+end $$;
+
 -- Orders: fabrication runs and purchases
 create table if not exists public.orders (
   id uuid primary key default gen_random_uuid(),
@@ -418,7 +444,7 @@ create table if not exists public.orders (
   user_id uuid references auth.users(id) on delete set null,
   customer_user_id uuid references auth.users(id) on delete set null,
   prompt_text text,
-  status text not null default 'new',
+  status public.order_status not null default 'new',
   fulfillment_status text not null default 'pending',
   payment_status text not null default 'unpaid',
   style text,
@@ -440,6 +466,46 @@ create table if not exists public.orders (
 );
 
 create index if not exists orders_org_status_idx on public.orders(org_id, status, created_at desc);
+
+alter table public.orders
+  drop constraint if exists orders_status_canonical_check;
+
+alter table public.orders
+  add constraint orders_status_canonical_check
+  check (status::text in (
+    'new',
+    'visualizing',
+    'await_image_pick',
+    'materializing',
+    'generating',
+    'repairing',
+    'slicing',
+    'ready_to_pay',
+    'paid',
+    'dispatching',
+    'printing',
+    'done',
+    'needs_review',
+    'generate_failed',
+    'repair_failed',
+    'slice_failed',
+    'dispatch_failed',
+    'cancelled'
+  ));
+
+create table if not exists public.order_transitions (
+  id uuid primary key default gen_random_uuid(),
+  order_id uuid not null references public.orders(id) on delete cascade,
+  from_status public.order_status,
+  to_status public.order_status not null,
+  authority text not null check (authority in ('chat','visualize','materialize','worker','stripe','operator','user','catalog')),
+  idempotency_key text not null,
+  meta_json jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  unique (order_id, idempotency_key)
+);
+
+create index if not exists order_transitions_order_created_idx on public.order_transitions(order_id, created_at desc);
 
 -- Order items capture immutable snapshots of product versions
 create table if not exists public.order_items (
@@ -488,6 +554,7 @@ create table if not exists public.profiles (
 );
 
 alter table public.orders enable row level security;
+alter table public.order_transitions enable row level security;
 alter table public.order_items enable row level security;
 alter table public.assets enable row level security;
 alter table public.payments enable row level security;
@@ -507,6 +574,14 @@ create policy orders_insert_org on public.orders for insert with check (org_id =
 
 drop policy if exists orders_update_org on public.orders;
 create policy orders_update_org on public.orders for update using (org_id = public.current_org_id()) with check (org_id = public.current_org_id());
+
+drop policy if exists order_transitions_select_org on public.order_transitions;
+create policy order_transitions_select_org on public.order_transitions for select using (
+  exists (
+    select 1 from public.orders o
+    where o.id = public.order_transitions.order_id and o.org_id = public.current_org_id()
+  )
+);
 
 drop policy if exists order_items_select_org on public.order_items;
 create policy order_items_select_org on public.order_items for select using (
@@ -599,7 +674,9 @@ create trigger trg_orders_touch_updated
 before update on public.orders
 for each row execute procedure public.touch_updated_at();
 
--- Claim-next-order function (security definer) to atomically lock one job
+-- Legacy claim-next-order compatibility shim.
+-- MVP-critical worker claims must use job-specific RPCs such as claim_i23d_task,
+-- which transition through public.transition_order and write order_transitions.
 create or replace function public.claim_next_order(p_worker_id uuid)
 returns public.orders
 language plpgsql
@@ -609,16 +686,7 @@ as $$
 declare
   claimed public.orders;
 begin
-  update public.orders o
-  set status = 'generating', worker_id = p_worker_id, locked_at = now(), status_updated_at = now()
-  where o.id = (
-    select id from public.orders
-    where status = 'new'
-    order by created_at asc
-    for update skip locked
-    limit 1
-  )
-  returning * into claimed;
+  claimed := null;
   return claimed;
 end;
 $$;
@@ -637,6 +705,101 @@ as $$
          coalesce(meta_json->'facts', '{}'::jsonb) || coalesce(p_facts, '{}'::jsonb)
        )
   where id = p_order_id;
+$$;
+
+create or replace function public.transition_order(
+  p_order_id uuid,
+  p_to_status public.order_status,
+  p_authority text,
+  p_expected_from public.order_status[] default null,
+  p_idempotency_key text default null,
+  p_meta_json jsonb default '{}'::jsonb
+)
+returns public.orders
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  current_order public.orders;
+  transition_key text;
+  already public.order_transitions;
+  allowed boolean := false;
+begin
+  if p_authority not in ('chat','visualize','materialize','worker','stripe','operator','user','catalog') then
+    raise exception 'invalid transition authority: %', p_authority;
+  end if;
+
+  transition_key := coalesce(nullif(p_idempotency_key, ''), p_authority || ':' || p_order_id::text || ':' || p_to_status::text);
+
+  select * into current_order
+  from public.orders
+  where id = p_order_id
+  for update;
+
+  if not found then
+    raise exception 'order not found: %', p_order_id;
+  end if;
+
+  select * into already
+  from public.order_transitions
+  where order_id = p_order_id and idempotency_key = transition_key;
+
+  if found then
+    return current_order;
+  end if;
+
+  if p_expected_from is not null and not (current_order.status = any(p_expected_from)) then
+    raise exception 'invalid current status %, expected %', current_order.status, p_expected_from;
+  end if;
+
+  if current_order.status = p_to_status then
+    allowed := true;
+  elsif current_order.status in ('done'::public.order_status, 'cancelled'::public.order_status) then
+    allowed := false;
+  elsif p_to_status = 'cancelled'::public.order_status and p_authority in ('user','operator') then
+    allowed := current_order.status not in ('paid'::public.order_status, 'dispatching'::public.order_status, 'printing'::public.order_status, 'done'::public.order_status);
+  elsif current_order.status in ('new'::public.order_status, 'await_image_pick'::public.order_status, 'generate_failed'::public.order_status, 'repair_failed'::public.order_status, 'slice_failed'::public.order_status, 'needs_review'::public.order_status) and p_to_status = 'visualizing'::public.order_status and p_authority in ('chat','visualize') then
+    allowed := true;
+  elsif current_order.status = 'visualizing'::public.order_status and p_to_status = 'await_image_pick'::public.order_status and p_authority in ('chat','visualize') then
+    allowed := true;
+  elsif current_order.status = 'await_image_pick'::public.order_status and p_to_status = 'materializing'::public.order_status and p_authority in ('chat','materialize') then
+    allowed := true;
+  elsif current_order.status = 'materializing'::public.order_status and p_to_status = 'generating'::public.order_status and p_authority = 'worker' then
+    allowed := true;
+  elsif current_order.status = 'generating'::public.order_status and p_to_status in ('repairing'::public.order_status, 'generate_failed'::public.order_status, 'needs_review'::public.order_status) and p_authority = 'worker' then
+    allowed := true;
+  elsif current_order.status = 'repairing'::public.order_status and p_to_status in ('slicing'::public.order_status, 'repair_failed'::public.order_status, 'needs_review'::public.order_status) and p_authority = 'worker' then
+    allowed := true;
+  elsif current_order.status = 'slice_failed'::public.order_status and p_to_status = 'slicing'::public.order_status and p_authority = 'worker' then
+    allowed := true;
+  elsif current_order.status = 'slicing'::public.order_status and p_to_status in ('ready_to_pay'::public.order_status, 'slice_failed'::public.order_status) and p_authority = 'worker' then
+    allowed := true;
+  elsif current_order.status = 'ready_to_pay'::public.order_status and p_to_status = 'paid'::public.order_status and p_authority = 'stripe' then
+    allowed := true;
+  elsif current_order.status = 'paid'::public.order_status and p_to_status = 'dispatching'::public.order_status and p_authority in ('operator','worker') then
+    allowed := true;
+  elsif current_order.status = 'dispatching'::public.order_status and p_to_status = 'printing'::public.order_status and p_authority in ('operator','worker') then
+    allowed := true;
+  elsif current_order.status = 'printing'::public.order_status and p_to_status = 'done'::public.order_status and p_authority in ('operator','worker') then
+    allowed := true;
+  end if;
+
+  if not allowed then
+    raise exception 'illegal order transition: % -> % by %', current_order.status, p_to_status, p_authority;
+  end if;
+
+  insert into public.order_transitions(order_id, from_status, to_status, authority, idempotency_key, meta_json)
+  values (p_order_id, current_order.status, p_to_status, p_authority, transition_key, coalesce(p_meta_json, '{}'::jsonb));
+
+  update public.orders
+  set status = p_to_status,
+      status_updated_at = now()
+  where id = p_order_id
+  returning * into current_order;
+
+  return current_order;
+end;
 $$;
 
 -- Atomically claim the next queued i23d generation task for a worker
@@ -668,9 +831,19 @@ begin
   where id = selected_task.id
   returning * into updated_task;
 
+  select *
+    into updated_order
+  from public.transition_order(
+    selected_task.order_id,
+    'generating'::public.order_status,
+    'worker',
+    array['materializing'::public.order_status],
+    'worker:claim_i23d:' || selected_task.id::text,
+    jsonb_build_object('task_id', selected_task.id, 'worker_id', p_worker_id)
+  );
+
   update public.orders
-  set status = case when status in ('new','visualizing','await_image_pick','materializing','generating') then 'generating' else status end,
-      worker_id = p_worker_id,
+  set worker_id = p_worker_id,
       locked_at = now()
   where id = selected_task.order_id
   returning * into updated_order;
@@ -683,9 +856,6 @@ $$;
 
 -- Unique index to avoid duplicate assets (when checksum known)
 create unique index if not exists assets_unique_order_kind_sha on public.assets(order_id, kind, sha256) where sha256 is not null;
-
--- Helpful enums (optional; use TEXT in code for flexibility)
--- create type order_status as enum ('new','visualizing','await_image_pick','materializing','generating','fabrication_requested','repairing','exporting','slicing','stl_ready','ready_to_pay','paid','dispatching','printing','done','needs_review','generate_failed','repair_failed','slice_failed','dispatch_failed','cancelled');
 
 -- Images: candidate and chosen images for Visualize step
 create table if not exists public.images (
@@ -724,6 +894,7 @@ create table if not exists public.generation_tasks (
   status text, -- queued|running|succeeded|failed
   worker_id uuid,
   claimed_at timestamptz,
+  idempotency_key text,
   cost_cents integer,
   payload_json jsonb default '{}'::jsonb,
   created_at timestamptz not null default now()
@@ -733,6 +904,9 @@ alter table public.generation_tasks enable row level security;
 
 create index if not exists generation_tasks_provider_idx on public.generation_tasks(provider, provider_task_id);
 create index if not exists generation_tasks_status_idx on public.generation_tasks(status, created_at);
+create unique index if not exists generation_tasks_order_kind_idempotency_idx
+  on public.generation_tasks(order_id, kind, idempotency_key)
+  where idempotency_key is not null;
 
 drop policy if exists generation_tasks_select_org on public.generation_tasks;
 create policy generation_tasks_select_org on public.generation_tasks for select using (

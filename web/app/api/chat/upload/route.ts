@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { createAdminClient, ensureStorageBucket, signedUrlWithInfo, normalizeSupabaseUrl } from '@/lib/supabaseAdmin'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { transitionOrder } from '@/lib/orderState'
 
 export const runtime = 'nodejs'
 
@@ -92,7 +93,14 @@ export async function POST(req: Request) {
     }
 
     if (attachments.length) {
-      await supabase.from('orders').update({ status: 'visualizing' }).eq('id', orderId)
+      await transitionOrder(supabase, {
+        orderId,
+        to: 'visualizing',
+        authority: 'visualize',
+        expectedFrom: ['new', 'await_image_pick', 'generate_failed', 'repair_failed', 'slice_failed', 'needs_review'],
+        idempotencyKey: `chat_upload:${orderId}:${attachments.map((item) => item.asset_id).join(',')}`,
+        meta: { attachment_count: attachments.length },
+      })
       await supabase.from('order_events').insert({
         order_id: orderId,
         phase: 'visualizing',

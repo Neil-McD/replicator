@@ -9,6 +9,7 @@ import { getEditProvider } from '@/lib/providers/edit'
 import { materializeSelectedImages } from '@/lib/materialize'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { transitionOrder } from '@/lib/orderState'
 
 export const runtime = 'nodejs'
 
@@ -18,7 +19,8 @@ type OAITool = {
 }
 
 function toOpenAITools() : OAITool[] {
-  return TOOL_REGISTRY.map((t) => ({
+  const nonAuthoritative = new Set(['fabricate_mesh', 'slice_and_quote', 'dispatch_print'])
+  return TOOL_REGISTRY.filter((t) => !nonAuthoritative.has(t.name)).map((t) => ({
     type: 'function',
     function: { name: t.name, description: t.description, parameters: t.schema },
   }))
@@ -39,7 +41,7 @@ Operating principles
 - Keep replies crisp and actionable, one or two sentences plus tool cards. Maintain printable expectations: single solid body, grounded base, upright orientation, metric sizing.
 
 Progression cues
-- Track satisfaction language (“looks good”, “that works”, “ready”, “ship it”, “perfect”). When a printable mesh exists and no quote is on record, run slice_and_quote automatically unless the user defers.
+- Track satisfaction language (“looks good”, “that works”, “ready”, “ship it”, “perfect”). When a printable mesh exists and no quote is on record, explain that the server/worker will slice and quote through the deterministic fabrication pipeline; do not choose slice, payment, or dispatch actions yourself.
 - After a quote is delivered, assume the next step is checkout or listing. Offer concise options (“Open checkout?”, “Stage a store card?”) while staying responsive to new edits.
 
 Context and continuity
@@ -60,10 +62,10 @@ Attachment handling
 Iteration policy
 - After concepts appear, suggest a selection or tweak, but prefer to act (edit or materialize) instead of asking for indices.
 - When the user selects or implicitly references a concept, materialize_i23d without requesting an index if a chosen image exists.
-- Once a stabilized mesh exists and the user indicates satisfaction or asks what’s next, proceed to slice_and_quote and report results.
+- Once a stabilized mesh exists and the user indicates satisfaction or asks what’s next, keep the response concise and defer slicing, quote, payment, and dispatch authority to the deterministic server/worker state machine.
 
 Tool policy
-- If no candidates exist and the user gives a prompt → visualize_generate({ prompt, n: 2, style: 'mechanical' }).
+- If no candidates exist and the user gives a prompt → visualize_generate({ prompt, n: 6, style: 'mechanical' }).
 - If candidates exist and the user selects/identifies one or says “make this real” → materialize_i23d using the current selection when available.
 - For “another angle/variant of this” → get_active_concept → concept_edit with a concise camera or detail hint.
 - Use viewer_focus only with concrete asset URLs (stl/toolpath) and keep URLs out of plain chat.
@@ -72,6 +74,7 @@ Tool policy
 
 Constraints
 - Never invent prices; only reference slicer quotes. Use mm. Decline unsafe content (weapons/illegal/IP).
+- The LLM is non-authoritative for MVP-critical state changes: slicing, pricing, payment, fabrication, and dispatch are controlled by server routes, Stripe webhooks, and the worker transition contract.
 - Keep provider names, model versions, and infrastructure details internal; never expose them in chat.
 
 Tone
@@ -90,9 +93,11 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'not_authenticated' }, { status })
     }
     const supabase = createAdminClient()
-    const { orderId, message } = (await req.json().catch(() => ({}))) as { orderId?: string; message?: string }
-    if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 })
-    if (!message || typeof message !== 'string') return NextResponse.json({ error: 'message required' }, { status: 400 })
+    const parsed = (await req.json().catch(() => ({}))) as { orderId?: string; message?: string }
+    if (!parsed.orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 })
+    if (!parsed.message || typeof parsed.message !== 'string') return NextResponse.json({ error: 'message required' }, { status: 400 })
+    const orderId: string = parsed.orderId
+    const message: string = parsed.message
     try {
       await requireOrderAccess(supabase, orderId, auth, 'id,user_id,status')
     } catch (error: any) {
@@ -287,6 +292,15 @@ export async function POST(req: Request) {
 
           if (!resolved.length) throw new Error('no_upload_assets')
 
+          await transitionOrder(supabase, {
+            orderId,
+            to: 'visualizing',
+            authority: 'chat',
+            expectedFrom: ['new', 'await_image_pick', 'generate_failed', 'repair_failed', 'slice_failed', 'needs_review'],
+            idempotencyKey: `chat:attachment_promote:start:${orderId}:${resolved.map((row: any) => row.id).join(',')}`,
+            meta: { source: 'attachment_promote', asset_ids: resolved.map((row: any) => row.id) },
+          })
+
           const insertRows = resolved.map((row: any) => {
             const meta = (row?.meta_json || {}) as Record<string, any>
             const payload: Record<string, any> = {
@@ -308,7 +322,14 @@ export async function POST(req: Request) {
             .select('id,url,meta_json')
           if (insertErr) throw insertErr
 
-          await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+          await transitionOrder(supabase, {
+            orderId,
+            to: 'await_image_pick',
+            authority: 'chat',
+            expectedFrom: ['visualizing', 'await_image_pick'],
+            idempotencyKey: `chat:attachment_promote:${orderId}:${(inserted || []).map((row: any) => row.id).join(',')}`,
+            meta: { image_count: inserted?.length || 0, source: 'attachment_promote' },
+          })
           try {
             await supabase.from('order_events').insert({
               order_id: orderId,
@@ -343,13 +364,28 @@ export async function POST(req: Request) {
               .limit(1)
             if (!existing || existing.length === 0) {
               const provider = getT2IProvider(process.env.T2I_PROVIDER)
-              const n = 2
+              const n = 6
               const style = 'mechanical' as const
+              await transitionOrder(supabase, {
+                orderId,
+                to: 'visualizing',
+                authority: 'chat',
+                expectedFrom: ['new', 'await_image_pick', 'generate_failed', 'repair_failed', 'slice_failed', 'needs_review'],
+                idempotencyKey: `chat:visualize:start:${orderId}:${message}:${n}`,
+                meta: { fallback: 'no_openai', n, style },
+              })
               const { imageUrls } = await provider.generateImages({ prompt: (message || '').toString(), n, style })
               if (imageUrls && imageUrls.length) {
                 const rows = imageUrls.map((url) => ({ order_id: orderId, kind: 'candidate', url, meta_json: { prompt: message, style } }))
                 const { data: inserted } = await supabase.from('images').insert(rows).select('id,url')
-                await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+                await transitionOrder(supabase, {
+                  orderId,
+                  to: 'await_image_pick',
+                  authority: 'chat',
+                  expectedFrom: 'visualizing',
+                  idempotencyKey: `chat:visualize:complete:${orderId}:${(inserted || []).map((row: any) => row.id).join(',')}`,
+                  meta: { fallback: 'no_openai', image_count: inserted?.length || 0 },
+                })
                 const cardImages = [] as any[]
                 for (const r of inserted || []) {
                   const canonical = normalizeSupabaseUrl(r.url) || r.url
@@ -394,7 +430,7 @@ export async function POST(req: Request) {
             try { snap = await buildContextSnapshot(orderId, { maxImages, maxAngles }) } catch {}
             if (snap) {
               messages = [
-                { role: 'system', content: `FACTS: ${JSON.stringify({ status: snap.status, quote: snap.quote, selected_image_id: snap.selected_image_id, chosen_index: snap.chosen_index, images: (snap.images||[]).map(x=>x.id).slice(0, maxImages), angles: (snap.angles||[]).map(a=>({ parent_image_id:a.parent_image_id, parent_index:a.parent_index||null, labels:a.labels, image_ids:a.image_ids })), last_angles_parent_id: snap.last_angles_parent_id||null, has_stl: !!snap.geometry?.stl_url })}` },
+                { role: 'system', content: `FACTS: ${JSON.stringify({ status: snap.status, quote: snap.quote, selected_image_id: snap.selected_image_id, chosen_index: snap.chosen_index, images: (snap.images||[]).map((x: any)=>x.id).slice(0, maxImages), angles: (snap.angles||[]).map((a: any)=>({ parent_image_id:a.parent_image_id, parent_index:a.parent_index||null, labels:a.labels, image_ids:a.image_ids })), last_angles_parent_id: snap.last_angles_parent_id||null, has_stl: !!snap.geometry?.stl_url })}` },
                 ...messages,
               ]
             }
@@ -477,8 +513,17 @@ export async function POST(req: Request) {
           } catch {}
           const prompt: string = (args?.prompt || message || '').toString()
           const style = args?.style
+          const n = Math.max(1, Math.min(6, Number(args?.n) || 6))
+          await transitionOrder(supabase, {
+            orderId,
+            to: 'visualizing',
+            authority: 'chat',
+            expectedFrom: ['new', 'await_image_pick', 'generate_failed', 'repair_failed', 'slice_failed', 'needs_review'],
+            idempotencyKey: `chat:visualize:start:${orderId}:${prompt}:${style || 'none'}:${n}`,
+            meta: { n, style: style || null },
+          })
           const provider = getT2IProvider(process.env.T2I_PROVIDER)
-          const { imageUrls } = await provider.generateImages({ prompt, n: 2, style })
+          const { imageUrls } = await provider.generateImages({ prompt, n, style })
           // Mirror to storage for reliability
           const bucket = process.env.SUPABASE_STORAGE_BUCKET || 'artifacts'
           try { await ensureStorageBucket(bucket) } catch {}
@@ -502,7 +547,14 @@ export async function POST(req: Request) {
             .insert(rows)
             .select('id,url')
           if (error) throw error
-          await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+          await transitionOrder(supabase, {
+            orderId,
+            to: 'await_image_pick',
+            authority: 'chat',
+            expectedFrom: 'visualizing',
+            idempotencyKey: `chat:visualize:complete:${orderId}:${(inserted || []).map((row: any) => row.id).join(',')}`,
+            meta: { image_count: inserted?.length || 0 },
+          })
           const indexed = [] as any[]
           for (let i = 0; i < (inserted || []).length; i++) {
             const row = inserted![i]
@@ -577,6 +629,14 @@ export async function POST(req: Request) {
           if (assetRow.kind !== 'upload_image') throw new Error('asset_not_image')
           let sourceUrl = assetRow.url as string
           try { sourceUrl = await signedUrlOrDirect(assetRow.url) } catch {}
+          await transitionOrder(supabase, {
+            orderId,
+            to: 'visualizing',
+            authority: 'chat',
+            expectedFrom: ['new', 'await_image_pick', 'generate_failed', 'repair_failed', 'slice_failed', 'needs_review'],
+            idempotencyKey: `chat:attachment_edit:start:${orderId}:${assetRow.id}:${prompt}:${n}`,
+            meta: { source: 'attachment_edit', asset_id: assetRow.id, n },
+          })
           const editor = getEditProvider(process.env.EDIT_PROVIDER)
           const { imageUrls, description } = await editor.editImage({ imageUrl: sourceUrl, prompt, n, format })
           if (!imageUrls || !imageUrls.length) throw new Error('edit_returned_no_images')
@@ -604,7 +664,14 @@ export async function POST(req: Request) {
             .insert(rows)
             .select('id,url')
           if (insertErr) throw insertErr
-          await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+          await transitionOrder(supabase, {
+            orderId,
+            to: 'await_image_pick',
+            authority: 'chat',
+            expectedFrom: ['new', 'visualizing', 'await_image_pick'],
+            idempotencyKey: `chat:attachment_promote:${orderId}:${inserted?.map((row: any) => row.id).join(',')}`,
+            meta: { image_count: inserted?.length || 0, source: 'attachment_promote' },
+          })
           try {
             await supabase.from('order_events').insert({
               order_id: orderId,
@@ -907,7 +974,14 @@ export async function POST(req: Request) {
           const rows = mirrored2.map((it) => ({ order_id: orderId, kind: 'candidate', url: it.url, meta_json: { parent_image_id: imgRow.id, edit_prompt: prompt, provider: 'nano-banana', description: description || null } }))
           const { data: inserted, error } = await supabase.from('images').insert(rows).select('id,url')
           if (error) throw error
-          await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+          await transitionOrder(supabase, {
+            orderId,
+            to: 'await_image_pick',
+            authority: 'chat',
+            expectedFrom: ['new', 'visualizing', 'await_image_pick'],
+            idempotencyKey: `chat:attachment_edit:${orderId}:${(inserted || []).map((row: any) => row.id).join(',')}`,
+            meta: { image_count: inserted?.length || 0, source: 'attachment_edit' },
+          })
           await supabase.from('order_events').insert({ order_id: orderId, phase: 'visualizing', message: `Edited concept`, meta_json: { parent_image_id: imgRow.id, n } })
           const images = [] as any[]
           for (const r of inserted || []) {
@@ -945,58 +1019,17 @@ export async function POST(req: Request) {
         }
 
         async function adapter_fabricate(_args: any) {
-          try {
-            const { data: row } = await supabase.from('orders').select('meta_json').eq('id', orderId).single()
-            const prev = (row?.meta_json as any) || {}
-            const next = { ...(typeof prev === 'object' && prev ? prev : {}), cancel_requested: false }
-            await supabase.from('orders').update({ meta_json: next }).eq('id', orderId)
-          } catch {}
-          const { data: orderRow } = await supabase.from('orders').select('status').eq('id', orderId).single()
-          const status = (orderRow?.status ?? null) as string | null
-          const busy = new Set(['fabrication_requested','repairing','slicing','stl_ready','ready_to_pay','paid','dispatching','printing'])
-          if (status && busy.has(status)) {
-            return { ok: true, status }
-          }
-          await supabase.from('orders').update({ status: 'fabrication_requested', worker_id: null, locked_at: null }).eq('id', orderId)
-          await supabase.from('order_events').insert({ order_id: orderId, phase: 'fabrication_requested', message: 'Assistant requested fabrication' })
-          try {
-            await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: 'On it — stabilizing the mesh for a print-ready quote.' } })
-          } catch {}
-          send({ role: 'assistant', type: 'text', content: { text: 'On it — stabilizing the mesh for a print-ready quote.' } })
-          return { ok: true, status: 'fabrication_requested' }
+          const txt = 'I can prepare a print quote after the selected concept has produced a stabilized mesh.'
+          try { await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: txt } }) } catch {}
+          send({ role: 'assistant', type: 'text', content: { text: txt } })
+          return { ok: false, error: 'fabricate_disabled_in_chat' }
         }
 
         async function adapter_slice_and_quote(args: any) {
-          try {
-            const { data: row } = await supabase.from('orders').select('meta_json').eq('id', orderId).single()
-            const prev = (row?.meta_json as any) || {}
-            const next = { ...(typeof prev === 'object' && prev ? prev : {}), cancel_requested: false }
-            await supabase.from('orders').update({ meta_json: next }).eq('id', orderId)
-          } catch {}
-          // Require a repaired STL, either from args or latest asset
-          let stlUrl: string | null = (args?.stlUrl as string) || null
-          if (!stlUrl) {
-            try {
-              const { data: rep } = await supabase
-                .from('assets')
-                .select('url')
-                .eq('order_id', orderId)
-                .eq('kind', 'repaired_stl')
-                .order('created_at', { ascending: false })
-                .limit(1)
-              stlUrl = rep?.[0]?.url || null
-            } catch {}
-          }
-          if (!stlUrl) {
-            return await adapter_fabricate(args)
-          }
-          await supabase.from('orders').update({ status: 'fabrication_requested', worker_id: null, locked_at: null }).eq('id', orderId)
-          await supabase.from('order_events').insert({ order_id: orderId, phase: 'fabrication_requested', message: 'Slice requested with STL', meta_json: { stlUrl } })
-          try {
-            await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: 'Slicing the provided STL with the Bambu profile.' } })
-          } catch {}
-          send({ role: 'assistant', type: 'text', content: { text: 'Slicing the provided STL with the Bambu profile.' } })
-          return { ok: true, stlUrl }
+          const txt = 'Slicing is queued by the deterministic print-check route after a repaired STL exists.'
+          try { await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: txt } }) } catch {}
+          send({ role: 'assistant', type: 'text', content: { text: txt } })
+          return { ok: false, error: 'slice_disabled_in_chat' }
         }
 
         async function adapter_repair_and_validate(_args: any) {
@@ -1051,56 +1084,20 @@ export async function POST(req: Request) {
             throw new Error('no_mesh_available')
           }
 
-          await supabase.from('orders').update({ status: 'fabrication_requested', worker_id: null, locked_at: null }).eq('id', orderId)
           try {
-            await supabase.from('order_events').insert({ order_id: orderId, phase: 'fabrication_requested', message: 'Repair requested via chat tool', meta_json: { requested_by: 'chat', intent: 'repair' } })
+            await supabase.from('order_events').insert({ order_id: orderId, phase: 'repair_request_ignored', message: 'Chat repair tool is non-authoritative', meta_json: { requested_by: 'chat', intent: 'repair' } })
           } catch {}
-          try {
-            await supabase.rpc('merge_order_facts', { p_order_id: orderId, p_facts: { fabrication_intent: 'repair' } })
-          } catch {}
-          const txt = 'Stabilizing the mesh — I’ll drop the repaired STL here once it passes checks.'
+          const txt = 'Mesh stabilization is handled by the deterministic worker after materialization.'
           try { await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: txt } }) } catch {}
           send({ role: 'assistant', type: 'text', content: { text: txt } })
-          return { ok: true, status: 'fabrication_requested' }
+          return { ok: false, error: 'repair_disabled_in_chat' }
         }
 
         async function adapter_dispatch_print(args: any) {
-          let threeMfUrl: string | null = typeof args?.threeMfUrl === 'string' && args.threeMfUrl ? args.threeMfUrl : null
-          if (!threeMfUrl) {
-            const { data: three } = await supabase
-              .from('assets')
-              .select('id,url,created_at')
-              .eq('order_id', orderId)
-              .eq('kind', 'three_mf')
-              .order('created_at', { ascending: false })
-              .limit(1)
-            threeMfUrl = three?.[0]?.url || null
-          }
-          if (!threeMfUrl) {
-            throw new Error('three_mf_missing')
-          }
-          const canonicalThreeMf = normalizeSupabaseUrl(threeMfUrl) || threeMfUrl
-          let signed = canonicalThreeMf
-          try { signed = (await signedUrlWithInfo(canonicalThreeMf)).url } catch {}
-          const link = buildBambuConnectLink(signed)
-
-          const { data: orderRow } = await supabase.from('orders').select('status').eq('id', orderId).single()
-          const currentStatus = orderRow?.status || null
-
-          if (currentStatus !== 'printing') {
-            await supabase.from('orders').update({ status: 'dispatching', worker_id: null, locked_at: null }).eq('id', orderId)
-            try {
-              await supabase.from('order_events').insert({ order_id: orderId, phase: 'dispatching', message: 'Dispatch link issued (chat)', meta_json: { link } })
-            } catch {}
-            await supabase.from('orders').update({ status: 'printing', worker_id: null, locked_at: null }).eq('id', orderId)
-            try {
-              await supabase.from('order_events').insert({ order_id: orderId, phase: 'printing', message: 'Awaiting operator print' })
-            } catch {}
-          }
-
-          try { await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: `Open to print: ${link}` } }) } catch {}
-          send({ role: 'assistant', type: 'text', content: { text: `Open to print: ${link}` } })
-          return { ok: true, link }
+          const txt = 'Print dispatch is available to operators after checkout is paid.'
+          try { await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: txt } }) } catch {}
+          send({ role: 'assistant', type: 'text', content: { text: txt } })
+          return { ok: false, error: 'dispatch_disabled_in_chat' }
         }
 
         async function executeTool(name: string, args: any) {

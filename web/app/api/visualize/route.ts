@@ -3,6 +3,7 @@ import { createAdminClient, ensureStorageBucket, signedUrlOrDirect, signedUrlWit
 import { getT2IProvider } from '@/lib/providers/t2i'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { transitionOrder } from '@/lib/orderState'
 
 export const runtime = 'nodejs'
 
@@ -19,8 +20,7 @@ export async function POST(req: Request) {
     const body = (await req.json().catch(() => ({}))) as any
     const orderId = body.orderId || body.order_id
     const prompt: string = (body.prompt || '').toString()
-    // Generate exactly up to 2 concepts by default (cost/control)
-    const n: number = Math.max(1, Math.min(2, Number(body.n) || 2))
+    const n: number = Math.max(1, Math.min(6, Number(body.n) || 6))
     const style: string | undefined = body.style || undefined
     if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 })
     if (!prompt) return NextResponse.json({ error: 'prompt required' }, { status: 400 })
@@ -47,7 +47,16 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'prompt_blocked' }, { status: 400 })
     }
 
-    // Generate N concepts via T2I provider (default: 2)
+    await transitionOrder(supabase, {
+      orderId,
+      to: 'visualizing',
+      authority: 'visualize',
+      expectedFrom: ['new', 'await_image_pick', 'generate_failed', 'repair_failed', 'slice_failed', 'needs_review'],
+      idempotencyKey: `visualize:start:${orderId}:${prompt}:${style || 'none'}:${n}`,
+      meta: { n, style: style || null },
+    })
+
+    // Generate N concepts via T2I provider (MVP default: 6)
     const provider = getT2IProvider(process.env.T2I_PROVIDER)
     const { imageUrls } = await provider.generateImages({ prompt, n, style })
     if (!imageUrls || imageUrls.length === 0) {
@@ -111,7 +120,14 @@ export async function POST(req: Request) {
         n: indexed.length,
       },
     })
-    await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+    await transitionOrder(supabase, {
+      orderId,
+      to: 'await_image_pick',
+      authority: 'visualize',
+      expectedFrom: 'visualizing',
+      idempotencyKey: `visualize:complete:${orderId}:${(inserted || []).map((row: any) => row.id).join(',')}`,
+      meta: { image_count: inserted?.length || 0 },
+    })
     await supabase.from('order_events').insert({ order_id: orderId, phase: 'visualizing', message: `Generated ${inserted?.length || 0} candidates` })
 
     return NextResponse.json({ images: inserted || [], message: 'ok' })

@@ -21,6 +21,8 @@ import sys
 import types
 import tempfile
 
+from order_state import transition_payload
+
 # Some environments omit the optional charset_normalizer dependency that
 # requests/trimesh use. Provide a tiny stub so trimesh imports cleanly and we
 # can still convert meshes to STL.
@@ -1435,8 +1437,7 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
 
     Priority:
     1) Orders with a queued i23d generation_task (created by /api/materialize)
-    2) Orders with status='new' that have at least one 'upload_image' asset
-    3) (Last resort) Old behavior via RPC or first 'new' order
+    2) Orders already in worker-owned canonical stages such as slicing
     """
     _claim_backoff_wait()
     # 0) Prefer queued i23d tasks via atomic RPC
@@ -1451,30 +1452,9 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
     except Exception as exc:
         _claim_backoff_register_failure(exc)
 
-    # 1) Prefer queued i23d tasks
-    try:
-        tasks = supabase_get("generation_tasks", {"status": "eq.queued", "kind": "eq.i23d", "order": "created_at.asc", "limit": 1})
-        if tasks:
-            t = tasks[0]
-            oid = t.get("order_id")
-            if oid:
-                # Mark order as generating and task as running
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"status": "generating", "worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
-                try:
-                    supabase_patch(
-                        "generation_tasks",
-                        {"id": f"eq.{t['id']}"},
-                        {"status": "running", "worker_id": WORKER_ID, "claimed_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
-                    )
-                except Exception:
-                    pass
-                # Fetch fresh order row
-                rows = supabase_get("orders", {"id": f"eq.{oid}", "limit": 1})
-                if rows:
-                    _claim_backoff_reset()
-                    return rows[0]
-    except Exception:
-        pass
+    # 1) Do not manually claim queued i23d tasks here. claim_i23d_task is the
+    # only valid i23d claim path because it atomically marks the task running
+    # and transitions materializing -> generating through transition_order.
 
     # 2) Orders explicitly marked for slicing (user requested quote)
     try:
@@ -1515,60 +1495,73 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
-    # 3) Orders with user-uploaded assets present (image or 3D model)
-    try:
-        # Consider up to N recent 'new' orders to avoid scanning entire table
-        candidates = supabase_get("orders", {"status": "eq.new", "order": "created_at.asc", "limit": 25}) or []
-        for o in candidates:
-            oid = o.get("id")
-            try:
-                ups = list_uploads(oid)
-            except Exception:
-                ups = []
-            has_image = any((u.get("kind") == "upload_image") for u in ups)
-            has_model = any((u.get("kind") in ("upload_stl","upload_obj","upload_glb")) for u in ups)
-            if has_image or has_model:
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"status": "generating", "worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
-                _claim_backoff_reset()
-                return o
-    except Exception:
-        pass
-
-    # 4) Fallback: atomic RPC (if present) — only accept if order has assets we can use
-    try:
-        claimed = supabase_rpc("claim_next_order", {"p_worker_id": WORKER_ID})
-        if claimed and isinstance(claimed, dict) and claimed.get("id"):
-            oid = claimed.get("id")
-            ups = []
-            try:
-                ups = list_uploads(oid)
-            except Exception:
-                ups = []
-            has_model = any(u.get("kind") in ("upload_stl","upload_obj","upload_glb") for u in ups)
-            has_image = any(u.get("kind") == "upload_image" for u in ups)
-            if has_model or has_image:
-                _claim_backoff_reset()
-                return claimed
-            # No useful assets — set back to new and skip
-            try:
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"status": "new", "worker_id": None, "locked_at": None})
-            except Exception:
-                pass
-    except Exception:
-        pass
     # No suitable orders
     return None
 
 def set_status(order_id: str, status: str):
     target_status = str(status)
-    params: Dict[str, Any] = {"id": f"eq.{order_id}"}
-    # Do not overwrite a client-requested cancellation with later worker updates.
-    if target_status.lower() != "cancelled":
-        params["status"] = "neq.cancelled"
+    legacy_extension_statuses = {"fabrication_requested", "exporting", "stl_ready"}
+    if target_status in legacy_extension_statuses:
+        log(f"[status] skipped legacy core status {target_status} for order {order_id}; use job tables/artifacts instead")
+        return
     try:
-        supabase_patch("orders", params, {"status": target_status})
+        current_status = None
+        try:
+            rows = supabase_get("orders", {"id": f"eq.{order_id}", "select": "status", "limit": 1}) or []
+            if rows:
+                current_status = rows[0].get("status")
+        except Exception:
+            current_status = None
+        idempotency_key = f"worker:{order_id}:{current_status or 'unknown'}:{target_status}"
+        supabase_rpc(
+            "transition_order",
+            transition_payload(
+                order_id=order_id,
+                to_status=target_status,
+                authority="worker",
+                expected_from=[current_status] if current_status else None,
+                idempotency_key=idempotency_key,
+                meta_json={"source": "worker.set_status", "from_status": current_status},
+            ),
+        )
     except Exception as exc:
-        log(f"[status] failed to set {target_status} for order {order_id}: {exc}")
+        log(f"[status] failed transition to {target_status} for order {order_id}: {exc}")
+
+
+def extract_slice_artifact_bytes(three_mf_path: Optional[str], minutes: float, grams: float) -> Tuple[Optional[bytes], bytes]:
+    slicedata_bytes = json.dumps(
+        {
+            "minutes": minutes,
+            "grams": grams,
+            "source": "bambu_cli",
+            "material": "PLA",
+            "printer": "Bambu X1C",
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    gcode_bytes: Optional[bytes] = None
+    if not three_mf_path or not os.path.exists(three_mf_path):
+        return None, slicedata_bytes
+    try:
+        import zipfile
+
+        with zipfile.ZipFile(three_mf_path, "r") as zf:
+            names = zf.namelist()
+            for candidate in ("Metadata/slicedata.json", "metadata/slicedata.json"):
+                if candidate in names:
+                    slicedata_bytes = zf.read(candidate)
+                    break
+            gcode_candidates = [
+                name for name in names
+                if name.lower().endswith(".gcode") or name.lower().endswith(".gcode.3mf")
+            ]
+            preferred = next((name for name in gcode_candidates if "plate_1" in name.lower()), None)
+            selected = preferred or (gcode_candidates[0] if gcode_candidates else None)
+            if selected:
+                gcode_bytes = zf.read(selected)
+    except Exception as exc:
+        log(f"[slice_artifacts] failed to inspect 3MF: {exc}", level="warning")
+    return gcode_bytes, slicedata_bytes
 
 
 def reload_order(order_id: str) -> Optional[Dict[str, Any]]:
@@ -1672,8 +1665,12 @@ def _order_cancelled(order_id: Optional[str]) -> bool:
 
 
 def _skip_if_cancelled(order_id: Optional[str], stage: str) -> bool:
-    if _order_cancelled(order_id):
-        # If user explicitly queued an Image→3D task, honor that over a stale soft‑cancel during generate.
+    status_val, flag = _fetch_order_state(order_id)
+    if status_val and status_val.lower() == "cancelled":
+        log(f"[cancel] Order {order_id} is cancelled before {stage}; skipping")
+        return True
+    if flag:
+        # If user explicitly queued an Image→3D task, honor that over a stale soft-cancel during generate.
         if stage in ("generate", "generating", "post_generate") and _has_active_i23d_task(order_id):
             log(
                 f"[cancel] Soft-cancel ignored for {stage} due to active i23D task",
@@ -4382,8 +4379,8 @@ def auto_stabilize_mesh(order: Dict[str, Any], raw_kind: str, raw_url: str, raw_
         except Exception:
             pass
     try:
-        set_status(oid, 'visualizing')
-        order['status'] = 'visualizing'
+        set_status(oid, 'slicing')
+        order['status'] = 'slicing'
     except Exception:
         pass
     try:
@@ -5191,6 +5188,10 @@ def process_slicing(order: Dict[str, Any]) -> bool:
             return False
         three_mf_url = None
         three_mf_sha: Optional[str] = None
+        gcode_url = None
+        gcode_sha: Optional[str] = None
+        slicedata_url = None
+        slicedata_sha: Optional[str] = None
         preview_url = None
         preview_sha: Optional[str] = None
         if three_mf_local and os.path.exists(three_mf_local):
@@ -5199,6 +5200,16 @@ def process_slicing(order: Dict[str, Any]) -> bool:
             three_mf_sha = sha256_bytes(three_mf_bytes)
             path = f"{oid}/{three_mf_sha}.3mf"
             three_mf_url = storage_upload_bytes(STORAGE_BUCKET, path, three_mf_bytes, content_type="model/3mf")
+            if minutes is not None and grams is not None:
+                gcode_bytes, slicedata_bytes = extract_slice_artifact_bytes(three_mf_local, float(minutes), float(grams))
+                if gcode_bytes:
+                    gcode_sha = sha256_bytes(gcode_bytes)
+                    gcode_path = f"{oid}/{gcode_sha}.gcode"
+                    gcode_url = storage_upload_bytes(STORAGE_BUCKET, gcode_path, gcode_bytes, content_type="text/plain")
+                if slicedata_bytes:
+                    slicedata_sha = sha256_bytes(slicedata_bytes)
+                    slicedata_path = f"{oid}/{slicedata_sha}.slicedata.json"
+                    slicedata_url = storage_upload_bytes(STORAGE_BUCKET, slicedata_path, slicedata_bytes, content_type="application/json")
         if preview_local and os.path.exists(preview_local):
             with open(preview_local, "rb") as f:
                 preview_bytes = f.read()
@@ -5209,13 +5220,44 @@ def process_slicing(order: Dict[str, Any]) -> bool:
         set_status(oid, "slice_failed")
         supabase_insert("order_events", {"order_id": oid, "phase": "slice_failed", "message": "slice_metrics_missing"})
         return False
+    if not (three_mf_url and gcode_url and slicedata_url and preview_url):
+        set_status(oid, "slice_failed")
+        supabase_insert(
+            "order_events",
+            {
+                "order_id": oid,
+                "phase": "slice_failed",
+                "message": "slice_artifacts_missing",
+                "meta_json": {
+                    "three_mf": bool(three_mf_url),
+                    "gcode": bool(gcode_url),
+                    "slicedata": bool(slicedata_url),
+                    "preview": bool(preview_url),
+                },
+            },
+        )
+        return False
     quote = compute_price(minutes, grams)
     quote["preview_url"] = preview_url
     quote["three_mf_url"] = three_mf_url
+    quote["gcode_url"] = gcode_url
+    quote["slicedata_url"] = slicedata_url
+    quote["material"] = "PLA"
+    quote["printer"] = "Bambu X1C"
+    if BAMBU_PROFILE and os.path.exists(BAMBU_PROFILE):
+        try:
+            with open(BAMBU_PROFILE, "rb") as f:
+                quote["profile_hash"] = sha256_bytes(f.read())
+        except Exception:
+            pass
     if preview_sha:
         quote['preview_sha256'] = preview_sha
     if three_mf_sha:
         quote['three_mf_sha256'] = three_mf_sha
+    if gcode_sha:
+        quote['gcode_sha256'] = gcode_sha
+    if slicedata_sha:
+        quote['slicedata_sha256'] = slicedata_sha
     asset_meta_base = {
         'quote_minutes': minutes,
         'quote_grams': grams,
@@ -5231,7 +5273,16 @@ def process_slicing(order: Dict[str, Any]) -> bool:
         three_mf_meta = dict(asset_meta_base)
         three_mf_meta['asset_role'] = 'toolpath'
         attach_asset(oid, "three_mf", three_mf_url, three_mf_sha, three_mf_meta)
-    supabase_patch("orders", {"id": f"eq.{oid}"}, {"quote_json": quote, "status": "ready_to_pay"})
+    if gcode_url:
+        gcode_meta = dict(asset_meta_base)
+        gcode_meta['asset_role'] = 'gcode'
+        attach_asset(oid, "gcode", gcode_url, gcode_sha, gcode_meta)
+    if slicedata_url:
+        slicedata_meta = dict(asset_meta_base)
+        slicedata_meta['asset_role'] = 'slicedata'
+        attach_asset(oid, "slicedata", slicedata_url, slicedata_sha, slicedata_meta)
+    supabase_patch("orders", {"id": f"eq.{oid}"}, {"quote_json": quote})
+    set_status(oid, "ready_to_pay")
     supabase_insert("order_events", {"order_id": oid, "phase": "ready_to_pay", "message": "Quote ready", "meta_json": quote})
     record_domain_event(
         org_id=order.get("org_id"),
