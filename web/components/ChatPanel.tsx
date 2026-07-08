@@ -7,15 +7,34 @@ import { authedFetch, getAccessToken, onAccessTokenChange } from "@/lib/clientAu
 import CommandInput from "@/components/CommandInput"
 
 type ViewerFocusKind = 'stl' | 'glb' | 'gltf' | 'obj' | 'toolpath'
-type ViewerFocusMeta = { assetId?: string | null; createdAt?: string | number | null }
+type ViewerFocusMeta = {
+  assetId?: string | null
+  createdAt?: string | number | null
+  storageUrl?: string | null
+  expiresAt?: string | number | null
+  metrics?: any
+}
 type HistoryMessage = { id: string; role: 'user'|'assistant'|'tool'; type?: string | null; content?: any; created_at?: string | null }
+type InitialAttachmentItem =
+  | AttachmentItem
+  | {
+      asset_id: string
+      url: string
+      storage_url?: string | null
+      expires_at?: number | null
+      pending?: boolean | null
+      label?: string | null
+      name?: string | null
+      size?: number | null
+      content_type?: string | null
+    }
 type ChatPanelProps = {
   orderId?: string | null
   title?: string
   loadingSnapshot?: boolean
   initialMessages?: HistoryMessage[] | null
   initialStatus?: string | null
-  initialAttachments?: AttachmentItem[] | null
+  initialAttachments?: InitialAttachmentItem[] | null
   onOrderCreated?: (id: string)=>void
   onViewerFocus?: (kind: ViewerFocusKind, url: string, assetKind?: string | null, meta?: ViewerFocusMeta)=>void
   variant?: 'classic'|'device'
@@ -128,7 +147,7 @@ export default function ChatPanel(_props: ChatPanelProps) {
   // Track last asset id we focused to avoid duplicate viewer updates
   const lastFocusAssetIdRef = useRef<string | null>(null)
   const historyAppliedOrderRef = useRef<string | null>(null)
-  const processAssistantEventRef = useRef<(evt: any, source?: 'stream' | 'history') => void>(() => {})
+  const processAssistantEventRef = useRef<(evt: any, source?: 'stream' | 'history' | 'channel') => void>(() => {})
   // Worker health tracking: start when materialization begins, warn if no progress
   const jobStartAtRef = useRef<number | null>(null)
   const workerWarnedRef = useRef<boolean>(false)
@@ -804,7 +823,7 @@ export default function ChatPanel(_props: ChatPanelProps) {
     })
   }, [messages, streaming])
 
-  processAssistantEventRef.current = (evt: any, source: 'stream' | 'history' = 'stream') => {
+  processAssistantEventRef.current = (evt: any, source: 'stream' | 'history' | 'channel' = 'stream') => {
     try {
       if (!evt || evt.role !== 'assistant') return
       // Guard against cross-order events if any leak through

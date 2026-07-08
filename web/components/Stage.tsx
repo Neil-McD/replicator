@@ -288,7 +288,7 @@ type StageCandidate = {
   assetKind?: string | null
   assetId?: string | null
   createdAt?: string | number | null
-  source?: 'sse' | 'poll' | 'manual' | 'rehydrate'
+  source?: 'sse' | 'poll' | 'manual' | 'rehydrate' | 'refresh'
   storageUrl?: string | null
   expiresAt?: number | null
   meta?: any
@@ -2557,8 +2557,9 @@ export default function Stage({
             return
           }
           const existing = objectRef.current
-          if (existing && (existing as any).isMesh && existing.material === material) {
-            const prevMesh = existing as THREE.Mesh
+          const existingMesh = existing && (existing as any).isMesh ? (existing as THREE.Mesh) : null
+          if (existingMesh && existingMesh.material === material) {
+            const prevMesh = existingMesh
             try {
               const sharedGeomPrev = (prevMesh.geometry as any)?.userData?.__replicatorShared === true
               if (!sharedGeomPrev) prevMesh.geometry?.dispose?.()
@@ -2782,8 +2783,9 @@ export default function Stage({
         stlLoader.load(url, (geometry: THREE.BufferGeometry) => {
           geometry.computeVertexNormals(); geometry.computeBoundingBox(); const bb = geometry.boundingBox!; const c = bb.getCenter(new THREE.Vector3()); geometry.translate(-c.x, -bb.min.y, -c.z)
           const existing = objectRef.current
-          if (existing && (existing as any).isMesh && existing.material === material) {
-            const prevMesh = existing as THREE.Mesh
+          const existingMesh = existing && (existing as any).isMesh ? (existing as THREE.Mesh) : null
+          if (existingMesh && existingMesh.material === material) {
+            const prevMesh = existingMesh
             try { prevMesh.geometry?.dispose?.() } catch {}
             prevMesh.geometry = geometry
             // Avoid pre-clamp for sized assets; exact scaling will be applied.
@@ -3242,7 +3244,8 @@ export default function Stage({
         obj.updateMatrixWorld(true)
       }
       const exporter = new STLExporter()
-      const data = exporter.parse(obj, { binary: true }) as ArrayBuffer
+      const exported = exporter.parse(obj, { binary: true }) as unknown
+      const data: BlobPart = exported instanceof DataView || exported instanceof ArrayBuffer ? exported : String(exported)
       const blob = new Blob([data], { type: 'model/stl' })
       const dl = URL.createObjectURL(blob)
       const a = document.createElement('a')

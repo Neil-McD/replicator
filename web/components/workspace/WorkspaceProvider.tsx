@@ -13,7 +13,7 @@ export type LocalPreviewState = {
   assetKind?: string | null
   assetId?: string | null
   createdAt?: string | number | null
-  source?: 'sse' | 'poll' | 'rehydrate' | 'manual'
+  source?: 'sse' | 'poll' | 'rehydrate' | 'refresh' | 'manual'
   storageUrl?: string | null
   expiresAt?: number | null
   previewUrl?: string | null
@@ -208,16 +208,17 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
       setInitialMessages(history)
       setInitialStatus(snap.status ?? null)
       setInitialAttachments(Array.isArray(snap.attachments) && snap.attachments.length ? [...snap.attachments] : null)
-      if (snap.geometry?.viewer_url || snap.geometry?.stl_url) {
+      const geometry = snap.geometry
+      if (geometry?.viewer_url || geometry?.stl_url) {
         // Prefer viewer-optimized GLB via content-addressed gateway when available
         let kind: LocalPreviewState['kind'] = 'stl'
-        let url = snap.geometry.stl_url!
-        let meta: any = snap.geometry.metrics ?? null
-        if (snap.geometry.viewer_url) {
+        let url = geometry.stl_url!
+        let meta: any = geometry.metrics ?? null
+        if (geometry.viewer_url) {
           kind = 'glb'
-          url = snap.geometry.viewer_url
+          url = geometry.viewer_url
           // Prefer viewer meta when present (carries viewer=true, target size, etc.)
-          meta = snap.geometry.viewer_meta ?? meta
+          meta = geometry.viewer_meta ?? meta
           if (meta && typeof meta === 'object') {
             try { meta.viewer = true } catch {}
           } else {
@@ -225,7 +226,7 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
           }
         }
         // If we have a content hash, route through artifact gateway with token param for auth
-        const sha = snap.geometry.viewer_sha256 || snap.geometry.sha256 || null
+        const sha = geometry.viewer_sha256 || geometry.sha256 || null
         if (sha) {
           // We do not await token here to avoid blocking UI; fall back to signed URL if token load fails.
           ;(async () => {
@@ -237,13 +238,13 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
                   url: gateway,
                   kind: kind === 'glb' ? 'glb' : 'stl',
                   ext: kind === 'glb' ? 'glb' : 'stl',
-                  assetKind: snap.geometry.kind ?? null,
-                  assetId: snap.geometry.asset_id ?? null,
+                  assetKind: geometry.kind ?? null,
+                  assetId: geometry.asset_id ?? null,
                   source: options?.source === 'cache' ? 'rehydrate' : 'refresh',
-                  storageUrl: snap.geometry.storage_url ?? null,
-                  expiresAt: snap.geometry.expires_at ?? null,
-                  previewUrl: snap.geometry.preview_url ?? null,
-                  previewExpiresAt: snap.geometry.preview_expires_at ?? null,
+                  storageUrl: geometry.storage_url ?? null,
+                  expiresAt: geometry.expires_at ?? null,
+                  previewUrl: geometry.preview_url ?? null,
+                  previewExpiresAt: geometry.preview_expires_at ?? null,
                   meta,
                 })
                 return
@@ -254,13 +255,13 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
               url,
               kind,
               ext: kind,
-              assetKind: snap.geometry.kind ?? null,
-              assetId: snap.geometry.asset_id ?? null,
+              assetKind: geometry.kind ?? null,
+              assetId: geometry.asset_id ?? null,
               source: options?.source === 'cache' ? 'rehydrate' : 'refresh',
-              storageUrl: snap.geometry.storage_url ?? null,
-              expiresAt: snap.geometry.expires_at ?? null,
-              previewUrl: snap.geometry.preview_url ?? null,
-              previewExpiresAt: snap.geometry.preview_expires_at ?? null,
+              storageUrl: geometry.storage_url ?? null,
+              expiresAt: geometry.expires_at ?? null,
+              previewUrl: geometry.preview_url ?? null,
+              previewExpiresAt: geometry.preview_expires_at ?? null,
               meta,
             })
           })()
@@ -269,13 +270,13 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
             url,
             kind,
             ext: kind,
-            assetKind: snap.geometry.kind ?? null,
-            assetId: snap.geometry.asset_id ?? null,
+            assetKind: geometry.kind ?? null,
+            assetId: geometry.asset_id ?? null,
             source: options?.source === 'cache' ? 'rehydrate' : 'refresh',
-            storageUrl: snap.geometry.storage_url ?? null,
-            expiresAt: snap.geometry.expires_at ?? null,
-            previewUrl: snap.geometry.preview_url ?? null,
-            previewExpiresAt: snap.geometry.preview_expires_at ?? null,
+            storageUrl: geometry.storage_url ?? null,
+            expiresAt: geometry.expires_at ?? null,
+            previewUrl: geometry.preview_url ?? null,
+            previewExpiresAt: geometry.preview_expires_at ?? null,
             meta,
           })
         }
