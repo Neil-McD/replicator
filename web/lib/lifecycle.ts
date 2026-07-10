@@ -319,4 +319,5 @@ export const lifecycle = {
   requestDispatch: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'requestDispatch' }),
   recordPrintingStarted: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'recordPrintingStarted' }),
   cancelOrder: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'cancelOrder' }),
+  publishCatalogVersion: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'publishCatalogVersion' }),
 }

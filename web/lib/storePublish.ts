@@ -4,7 +4,7 @@ import { Buffer } from 'buffer'
 import { createAdminClient, parseSupabaseUrl, signedUrlOrDirect } from '@/lib/supabaseAdmin'
 import { ensureOrgForUser } from '@/lib/orgs'
 import { parseDataUrl, toNumber } from '@/lib/storeUtils'
-import { hashForIdempotency } from '@/lib/lifecycle'
+import { hashForIdempotency, idempotencyKeys, lifecycle } from '@/lib/lifecycle'
 
 const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET ?? 'artifacts'
 const DEFAULT_PRICE_CENTS = Number(process.env.DEFAULT_STORE_PRICE_CENTS || 2800)
@@ -184,9 +184,48 @@ export async function handleStoreRequest(options: {
   const defaultDescription = `Generated via Replicator · ${orderRow.material || 'PLA'} · Longest side ${effectiveTarget ? `${Math.round(effectiveTarget)}mm` : 'custom'}.`
   const description = sanitizeText(body?.description, defaultDescription)
 
+  const productId = randomUUID()
+  const versionNumber = 1
+
+  const infoJson: Record<string, any> = {
+    source: 'order',
+    order_id: orderId,
+    origin_asset_id: printableAsset.id,
+    source_asset_ids: {
+      printable_stl: printableAsset.id,
+      three_mf: threeMf?.id || null,
+      preview: preview?.id || null,
+      slice_data: sliceData?.id || null,
+    },
+    target_max_dim_mm: effectiveTarget,
+    quote,
+  }
+  if (sizedMeta?.orientation) infoJson.orientation = sizedMeta.orientation
+  if (sizedMeta?.bbox_mm) infoJson.bbox_mm = sizedMeta.bbox_mm
+
+  const sourceArtifactSetHash = hashForIdempotency(infoJson.source_asset_ids)
+  const sourceProfileHash = String(quote?.profile_hash || process.env.BAMBUSTUDIO_PROFILE_PATH || 'default')
+  const priceHash = hashForIdempotency({ price_cents: priceCents, cost_cents: costCents, status: statusOverride, visibility: visibilityOverride })
+
+  await lifecycle.publishCatalogVersion({
+    supabase,
+    orderId,
+    actor: auth.user?.id || 'user',
+    idempotencyKey: idempotencyKeys.catalogPublish(productId, orderId, sourceArtifactSetHash, priceHash),
+    metadata: {
+      product_id: productId,
+      version: versionNumber,
+      source_artifact_set_hash: sourceArtifactSetHash,
+      source_profile_hash: sourceProfileHash,
+      status: statusOverride,
+      visibility: visibilityOverride,
+    },
+  })
+
   const productInsert = await supabase
       .from('products')
       .insert({
+        id: productId,
         org_id: orgId,
         status: statusOverride,
         visibility: visibilityOverride,
@@ -194,25 +233,6 @@ export async function handleStoreRequest(options: {
       .select('id')
       .single()
   if (productInsert.error || !productInsert.data?.id) throw productInsert.error ?? new Error('product_insert_failed')
-
-    const productId = productInsert.data.id as string
-    const versionNumber = 1
-
-    const infoJson: Record<string, any> = {
-      source: 'order',
-      order_id: orderId,
-      origin_asset_id: printableAsset.id,
-      source_asset_ids: {
-        printable_stl: printableAsset.id,
-        three_mf: threeMf?.id || null,
-        preview: preview?.id || null,
-        slice_data: sliceData?.id || null,
-      },
-      target_max_dim_mm: effectiveTarget,
-      quote,
-    }
-    if (sizedMeta?.orientation) infoJson.orientation = sizedMeta.orientation
-    if (sizedMeta?.bbox_mm) infoJson.bbox_mm = sizedMeta.bbox_mm
 
     const versionInsert = await supabase
       .from('product_versions')
@@ -227,8 +247,8 @@ export async function handleStoreRequest(options: {
         info_json: infoJson,
         source_order_id: orderId,
         source_quote_json: quote,
-        source_profile_hash: String(quote?.profile_hash || process.env.BAMBUSTUDIO_PROFILE_PATH || 'default'),
-        source_artifact_set_hash: hashForIdempotency(infoJson.source_asset_ids),
+        source_profile_hash: sourceProfileHash,
+        source_artifact_set_hash: sourceArtifactSetHash,
         print_time_seconds: toNumber(quote?.minutes, 0) * 60,
         material_grams: Number(quote?.grams) || null,
       })

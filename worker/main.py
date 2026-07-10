@@ -1562,6 +1562,10 @@ WORKER_TRANSITIONS = {
 }
 
 
+class LifecycleTransitionError(RuntimeError):
+    pass
+
+
 def normalize_order_status(status: Any) -> str:
     raw = str(status or "new").strip()
     if raw in CANONICAL_ORDER_STATUSES:
@@ -1605,33 +1609,39 @@ def _record_order_command(order_id: str, command: str, key: str, status: str, me
 
 def transition_order_status(order_id: str, command: str, target_status: str, metadata: Optional[Dict[str, Any]] = None):
     target_status = normalize_order_status(target_status)
+    key = _transition_idempotency_key(order_id, command, target_status, metadata)
     rule = WORKER_TRANSITIONS.get(command)
     if not rule or rule[1] != target_status:
-        log(f"[status] illegal worker command target {command}->{target_status}", level="warning", order_id=order_id)
-        return
-    key = _transition_idempotency_key(order_id, command, target_status, metadata)
+        message = f"illegal_worker_transition_target:{command}:{target_status}"
+        _record_order_command(order_id, command, key, "failed", metadata, {"error": message})
+        log(f"[status] {message}", level="warning", order_id=order_id)
+        raise LifecycleTransitionError(message)
     rows = supabase_get("orders", {"id": f"eq.{order_id}", "select": "id,status", "limit": 1}) or []
     if not rows:
-        log(f"[status] order not found for transition {command}", level="warning", order_id=order_id)
-        return
+        message = f"order_not_found:{command}"
+        _record_order_command(order_id, command, key, "failed", metadata, {"error": message})
+        log(f"[status] {message}", level="warning", order_id=order_id)
+        raise LifecycleTransitionError(message)
     current_raw = str(rows[0].get("status") or "new")
     current = normalize_order_status(current_raw)
     allowed_from, _ = rule
     if current == target_status:
         _record_order_command(order_id, command, key, "succeeded", metadata, {"status": target_status, "noop": True})
-        return
+        return {"status": target_status, "noop": True}
     if current not in allowed_from:
-        _record_order_command(order_id, command, key, "failed", metadata, {"error": f"invalid_transition:{current}:{command}:{target_status}"})
-        log(f"[status] invalid transition {current}:{command}->{target_status}", level="warning", order_id=order_id)
-        return
+        message = f"invalid_transition:{current}:{command}:{target_status}"
+        _record_order_command(order_id, command, key, "failed", metadata, {"error": message})
+        log(f"[status] {message}", level="warning", order_id=order_id)
+        raise LifecycleTransitionError(message)
     _record_order_command(order_id, command, key, "started", metadata)
     params: Dict[str, Any] = {"id": f"eq.{order_id}", "status": f"eq.{current_raw}"}
     try:
         updated = supabase_patch("orders", params, {"status": target_status})
         if isinstance(updated, list) and not updated:
-            _record_order_command(order_id, command, key, "failed", metadata, {"error": "stale_status"})
-            log(f"[status] stale transition {current}:{command}->{target_status}", level="warning", order_id=order_id)
-            return
+            message = f"stale_transition:{current}:{command}:{target_status}"
+            _record_order_command(order_id, command, key, "failed", metadata, {"error": message})
+            log(f"[status] {message}", level="warning", order_id=order_id)
+            raise LifecycleTransitionError(message)
         _record_order_command(order_id, command, key, "succeeded", metadata, {"status": target_status})
         try:
             supabase_insert("order_events", {
@@ -1642,8 +1652,14 @@ def transition_order_status(order_id: str, command: str, target_status: str, met
             })
         except Exception:
             pass
+        return {"status": target_status}
     except Exception as exc:
+        if isinstance(exc, LifecycleTransitionError):
+            raise
+        message = f"transition_patch_failed:{command}:{target_status}:{exc}"
+        _record_order_command(order_id, command, key, "failed", metadata, {"error": message})
         log(f"[status] failed to set {target_status} for order {order_id}: {exc}")
+        raise LifecycleTransitionError(message) from exc
 
 
 def set_status(order_id: str, status: str):
@@ -2201,7 +2217,10 @@ def _process_repair_job(job: Dict[str, Any]) -> bool:
             'completed_at': now_iso(),
             'worker_id': WORKER_ID,
         })
-        set_status(order_id, 'repair_failed')
+        try:
+            set_status(order_id, 'repair_failed')
+        except Exception as status_exc:
+            log(f"[repair] failed to record repair_failed: {status_exc}", level="warning", order_id=order_id)
         record_order_event(order_id, 'repair_failed', str(exc)[:200], severity='error', meta={'job_id': job_id})
         return True
 
@@ -2230,6 +2249,8 @@ def _process_dispatch_job(job: Dict[str, Any]) -> bool:
         if not signed:
             raise RuntimeError("Failed to sign 3MF URL")
         link = build_bambu_connect_link(signed)
+        transition_order_status(order_id, "recordDispatchIssued", "dispatching", {"job_id": job_id, "asset_id": three_mf.get("id")})
+        set_status(order_id, "printing")
         try:
             supabase_insert("chat_messages", {"order_id": order_id, "role": "assistant", "type": "text", "content_json": {"text": f"Open to print: {link}"}})
         except Exception:
@@ -2241,8 +2262,6 @@ def _process_dispatch_job(job: Dict[str, Any]) -> bool:
             'worker_id': WORKER_ID,
             'meta_json': _merge_dict(job.get('meta_json'), {'link': link, 'expires_at': expires_at}),
         })
-        transition_order_status(order_id, "recordDispatchIssued", "dispatching", {"job_id": job_id, "asset_id": three_mf.get("id")})
-        set_status(order_id, "printing")
         return True
     except Exception as exc:
         mark_export_job(job_id, {
@@ -2251,7 +2270,10 @@ def _process_dispatch_job(job: Dict[str, Any]) -> bool:
             'completed_at': now_iso(),
             'worker_id': WORKER_ID,
         })
-        set_status(order_id, "dispatch_failed")
+        try:
+            set_status(order_id, "dispatch_failed")
+        except Exception as status_exc:
+            log(f"[dispatch] failed to record dispatch_failed: {status_exc}", level="warning", order_id=order_id)
         record_order_event(order_id, "dispatch_failed", str(exc)[:200], severity='error', meta={'job_id': job_id})
         return True
 
@@ -2422,8 +2444,10 @@ def _process_slice_job(job: Dict[str, Any]) -> bool:
             'worker_id': WORKER_ID
         })
 
-        # Set order status to slice_failed
-        set_status(order_id, 'slice_failed')
+        try:
+            set_status(order_id, 'slice_failed')
+        except Exception as status_exc:
+            log(f"[slice] failed to record slice_failed: {status_exc}", level="warning", order_id=order_id)
 
         record_order_event(
             order_id,
@@ -4560,15 +4584,12 @@ def auto_stabilize_mesh(order: Dict[str, Any], raw_kind: str, raw_url: str, raw_
             supabase_insert('order_events', {'order_id': oid, 'phase': phase, 'message': msg, 'meta_json': slice_check})
         except Exception:
             pass
-    try:
-        transition_order_status(oid, 'recordRepairSucceeded', 'slicing', {
-            'raw_asset_id': raw_asset_id,
-            'repaired_asset_id': repaired_asset_id,
-            'repaired_sha256': sha_repaired,
-        })
-        order['status'] = 'slicing'
-    except Exception:
-        pass
+    transition_order_status(oid, 'recordRepairSucceeded', 'slicing', {
+        'raw_asset_id': raw_asset_id,
+        'repaired_asset_id': repaired_asset_id,
+        'repaired_sha256': sha_repaired,
+    })
+    order['status'] = 'slicing'
     try:
         supabase_insert("order_events", {"order_id": oid, "phase": "stabilized", "message": "Mesh stabilized", "meta_json": {'floating_component_count': floating_count, 'orientation': orient_summary}})
     except Exception:

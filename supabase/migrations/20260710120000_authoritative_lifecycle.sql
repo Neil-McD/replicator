@@ -87,3 +87,96 @@ alter table public.product_assets
   add column if not exists source_asset_id uuid references public.assets(id);
 
 create index if not exists product_assets_source_asset_id_idx on public.product_assets(source_asset_id);
+
+-- Legacy order claiming may lock rows for compatibility, but it must not move
+-- customer-visible lifecycle state. New worker production queues use
+-- generation_tasks/export_jobs instead.
+create or replace function public.claim_next_order(p_worker_id uuid)
+returns public.orders
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  claimed public.orders;
+begin
+  update public.orders o
+  set worker_id = p_worker_id,
+      locked_at = now()
+  where o.id = (
+    select id from public.orders
+    where status = 'new'
+    order by created_at asc
+    for update skip locked
+    limit 1
+  )
+  returning * into claimed;
+  return claimed;
+end;
+$$;
+
+-- Replace older schema/RPC definitions that made provider queue claiming a
+-- customer-visible lifecycle transition. Claiming a generation task is provider
+-- queue state only; materializing is recorded by the lifecycle command layer.
+drop function if exists public.claim_i23d_task(uuid);
+
+create function public.claim_i23d_task(p_worker_id uuid)
+returns table(order_data public.orders, task_data public.generation_tasks)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  selected_task public.generation_tasks;
+  updated_task public.generation_tasks;
+  updated_order public.orders;
+begin
+  select *
+    into selected_task
+  from public.generation_tasks
+  where kind = 'i23d' and status = 'queued'
+  order by created_at asc
+  limit 1
+  for update skip locked;
+
+  if not found then
+    return;
+  end if;
+
+  update public.generation_tasks
+  set status = 'running', worker_id = p_worker_id, claimed_at = now()
+  where id = selected_task.id
+  returning * into updated_task;
+
+  update public.orders
+  set worker_id = p_worker_id,
+      locked_at = now()
+  where id = selected_task.order_id
+  returning * into updated_order;
+
+  order_data := updated_order;
+  task_data := updated_task;
+  return next;
+end;
+$$;
+
+create or replace function public.prevent_asset_identity_update()
+returns trigger
+language plpgsql
+as $$
+begin
+  if old.order_id is distinct from new.order_id
+    or old.kind is distinct from new.kind
+    or old.url is distinct from new.url
+    or old.sha256 is distinct from new.sha256 then
+    raise exception 'asset_identity_immutable';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists assets_prevent_identity_update on public.assets;
+create trigger assets_prevent_identity_update
+before update on public.assets
+for each row
+execute function public.prevent_asset_identity_update();

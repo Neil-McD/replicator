@@ -46,7 +46,17 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       await supabase.from('orders').update({ meta_json: next }).eq('id', orderId)
     } catch {}
 
-    // Check for existing pending/processing slice job (idempotent)
+    const command = await lifecycle.requestSliceQuote({
+      supabase,
+      orderId,
+      actor: auth.user?.id || 'user',
+      idempotencyKey: idempotencyKeys.sliceQuote(orderId, repaired[0]?.sha256 || repaired[0]?.id || null, process.env.BAMBUSTUDIO_PROFILE_PATH || 'default', 'env'),
+      metadata: { source: 'manual_retry' },
+    })
+
+    const commandJobId = command.result?.job_id
+
+    // Check for existing pending/processing slice job after lifecycle validation.
     const { data: existingJobs } = await supabase
       .from('export_jobs')
       .select('id,status')
@@ -56,40 +66,30 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       .order('created_at', { ascending: false })
       .limit(1)
 
-    if (existingJobs && existingJobs.length > 0) {
-      const existing = existingJobs[0]
-      return NextResponse.json({
-        ok: true,
-        jobId: existing.id,
-        status: existing.status,
-        reused: true
-      })
+    let jobRow = existingJobs?.[0] ?? null
+
+    if (!jobRow) {
+      const { data: insertedJob, error: jobErr } = await supabase
+        .from('export_jobs')
+        .insert({
+          order_id: orderId,
+          status: 'pending',
+          job_type: 'slice_quote',
+          requested_by: auth.user?.id ?? null,
+          meta_json: {
+            source: 'manual_retry',
+            idempotency_key: idempotencyKeys.sliceQuote(orderId, repaired[0]?.sha256 || repaired[0]?.id || null, process.env.BAMBUSTUDIO_PROFILE_PATH || 'default', 'env'),
+            requested_at: new Date().toISOString(),
+          }
+        })
+        .select('id,status')
+        .single()
+
+      if (jobErr || !insertedJob) {
+        throw jobErr || new Error('failed_to_enqueue_slice_job')
+      }
+      jobRow = insertedJob
     }
-
-    // Create new slice job in export_jobs queue
-    const { data: jobRow, error: jobErr } = await supabase
-      .from('export_jobs')
-      .insert({
-        order_id: orderId,
-        status: 'pending',
-        job_type: 'slice_quote',
-        requested_by: auth.user?.id ?? null,
-        meta_json: { source: 'manual_retry', requested_at: new Date().toISOString() }
-      })
-      .select('*')
-      .single()
-
-    if (jobErr || !jobRow) {
-      throw jobErr || new Error('failed_to_enqueue_slice_job')
-    }
-
-    await lifecycle.requestSliceQuote({
-      supabase,
-      orderId,
-      actor: auth.user?.id || 'user',
-      idempotencyKey: idempotencyKeys.sliceQuote(orderId, repaired[0]?.sha256 || repaired[0]?.id || null, process.env.BAMBUSTUDIO_PROFILE_PATH || 'default', 'env'),
-      metadata: { job_id: jobRow.id, source: 'manual_retry' },
-    })
 
     await supabase
       .from('order_events')
@@ -97,10 +97,10 @@ export async function POST(req: Request, { params }: { params: { id: string } })
         order_id: orderId,
         phase: 'slicing',
         message: 'Print check queued',
-        meta_json: { job_id: jobRow.id }
+        meta_json: { job_id: commandJobId || jobRow.id }
       })
 
-    return NextResponse.json({ ok: true, jobId: jobRow.id, status: jobRow.status })
+    return NextResponse.json({ ok: true, jobId: commandJobId || jobRow.id, status: jobRow.status, reused: command.reused })
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 })
   }
