@@ -288,7 +288,7 @@ type StageCandidate = {
   assetKind?: string | null
   assetId?: string | null
   createdAt?: string | number | null
-  source?: 'sse' | 'poll' | 'manual' | 'rehydrate'
+  source?: 'sse' | 'poll' | 'manual' | 'rehydrate' | 'refresh'
   storageUrl?: string | null
   expiresAt?: number | null
   meta?: any
@@ -2557,7 +2557,7 @@ export default function Stage({
             return
           }
           const existing = objectRef.current
-          if (existing && (existing as any).isMesh && existing.material === material) {
+          if (existing && (existing as any).isMesh && (existing as THREE.Mesh).material === material) {
             const prevMesh = existing as THREE.Mesh
             try {
               const sharedGeomPrev = (prevMesh.geometry as any)?.userData?.__replicatorShared === true
@@ -2782,7 +2782,7 @@ export default function Stage({
         stlLoader.load(url, (geometry: THREE.BufferGeometry) => {
           geometry.computeVertexNormals(); geometry.computeBoundingBox(); const bb = geometry.boundingBox!; const c = bb.getCenter(new THREE.Vector3()); geometry.translate(-c.x, -bb.min.y, -c.z)
           const existing = objectRef.current
-          if (existing && (existing as any).isMesh && existing.material === material) {
+          if (existing && (existing as any).isMesh && (existing as THREE.Mesh).material === material) {
             const prevMesh = existing as THREE.Mesh
             try { prevMesh.geometry?.dispose?.() } catch {}
             prevMesh.geometry = geometry
@@ -3242,7 +3242,7 @@ export default function Stage({
         obj.updateMatrixWorld(true)
       }
       const exporter = new STLExporter()
-      const data = exporter.parse(obj, { binary: true }) as ArrayBuffer
+      const data = exporter.parse(obj, { binary: true }) as unknown as ArrayBuffer
       const blob = new Blob([data], { type: 'model/stl' })
       const dl = URL.createObjectURL(blob)
       const a = document.createElement('a')

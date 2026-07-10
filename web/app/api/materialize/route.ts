@@ -40,6 +40,7 @@ export async function POST(req: Request) {
     const result = await materializeSelectedImages({
       supabase,
       orderId,
+      actor: auth.user?.id || 'user',
       imageIds,
       imageUrls,
       enableQuickMesh: ['1', 'true', 'yes', 'on'].includes(String(process.env.WEB_I23D_FALLBACK || '0').toLowerCase()),

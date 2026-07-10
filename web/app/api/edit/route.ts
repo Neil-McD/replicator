@@ -3,6 +3,7 @@ import { createAdminClient, signedUrlOrDirect, ensureStorageBucket, signedUrlWit
 import { getEditProvider } from '@/lib/providers/edit'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { lifecycle } from '@/lib/lifecycle'
 
 export const runtime = 'nodejs'
 
@@ -96,7 +97,13 @@ export async function POST(req: Request) {
     const rows = mirrored.map((it) => ({ order_id: orderId, kind: 'candidate', url: it.url, meta_json: { parent_image_id: imgRow.id, edit_prompt: prompt, provider: 'nano-banana', description: description || null } }))
     const { data: inserted, error } = await supabase.from('images').insert(rows).select('id,url')
     if (error) throw error
-    await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+    await lifecycle.recordVisualizationSucceeded({
+      supabase,
+      orderId,
+      actor: auth.user?.id || 'user',
+      idempotencyKey: `order:${orderId}:visualize:edit:${imgRow.id}:${prompt}`,
+      metadata: { source: 'edit', parent_image_id: imgRow.id, n },
+    })
     await supabase.from('order_events').insert({ order_id: orderId, phase: 'visualizing', message: 'Edited concept', meta_json: { parent_image_id: imgRow.id, n } })
     const imagesRaw = (inserted || []).slice(0, n)
     const signedMap = new Map<string, { url: string; storage_url: string; expires_at: number | null }>()

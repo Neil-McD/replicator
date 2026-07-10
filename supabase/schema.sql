@@ -610,7 +610,7 @@ declare
   claimed public.orders;
 begin
   update public.orders o
-  set status = 'generating', worker_id = p_worker_id, locked_at = now(), status_updated_at = now()
+  set worker_id = p_worker_id, locked_at = now()
   where o.id = (
     select id from public.orders
     where status = 'new'
@@ -669,8 +669,7 @@ begin
   returning * into updated_task;
 
   update public.orders
-  set status = case when status in ('new','visualizing','await_image_pick','materializing','generating') then 'generating' else status end,
-      worker_id = p_worker_id,
+  set worker_id = p_worker_id,
       locked_at = now()
   where id = selected_task.order_id
   returning * into updated_order;
@@ -684,8 +683,30 @@ $$;
 -- Unique index to avoid duplicate assets (when checksum known)
 create unique index if not exists assets_unique_order_kind_sha on public.assets(order_id, kind, sha256) where sha256 is not null;
 
+-- Assets are immutable evidence. Content identity cannot be rewritten in place.
+create or replace function public.prevent_asset_identity_update()
+returns trigger
+language plpgsql
+as $$
+begin
+  if old.order_id is distinct from new.order_id
+    or old.kind is distinct from new.kind
+    or old.url is distinct from new.url
+    or old.sha256 is distinct from new.sha256 then
+    raise exception 'asset_identity_immutable';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists assets_prevent_identity_update on public.assets;
+create trigger assets_prevent_identity_update
+before update on public.assets
+for each row
+execute function public.prevent_asset_identity_update();
+
 -- Helpful enums (optional; use TEXT in code for flexibility)
--- create type order_status as enum ('new','visualizing','await_image_pick','materializing','generating','fabrication_requested','repairing','exporting','slicing','stl_ready','ready_to_pay','paid','dispatching','printing','done','needs_review','generate_failed','repair_failed','slice_failed','dispatch_failed','cancelled');
+-- create type order_status as enum ('new','visualizing','await_image_pick','materializing','stabilizing','slicing','ready_to_pay','paid','dispatching','printing','done','needs_review','generate_failed','repair_failed','slice_failed','dispatch_failed','cancelled');
 
 -- Images: candidate and chosen images for Visualize step
 create table if not exists public.images (

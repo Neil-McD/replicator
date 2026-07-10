@@ -5,12 +5,14 @@ import { attachQuickMesh } from '@/lib/providers/i23d'
 import { getEditProvider } from '@/lib/providers/edit'
 import { mirrorRemoteImageToStorage } from '@/lib/storage'
 import { robustImageFetch } from '@/lib/httpFetch'
+import { idempotencyKeys, lifecycle } from '@/lib/lifecycle'
 
 type UploadResult = { id: string; assetUrl: string; viewRole?: string | null }
 
 export type MaterializeOptions = {
   supabase: SupabaseClient<any, any, any>
   orderId: string
+  actor?: string
   imageIds?: string[]
   imageUrls?: string[]
   autoAngles?: boolean
@@ -182,7 +184,7 @@ async function uploadImage(
 }
 
 export async function materializeSelectedImages(options: MaterializeOptions): Promise<MaterializeResult> {
-  const { supabase, orderId, autoAngles = true, enableQuickMesh = false } = options
+  const { supabase, orderId, actor = 'api', autoAngles = true, enableQuickMesh = false } = options
   // Clear cancel flag on new materialize intent to let worker proceed if a prior refresh set it
   try {
     const { data: row } = await supabase.from('orders').select('meta_json').eq('id', orderId).single()
@@ -240,7 +242,7 @@ export async function materializeSelectedImages(options: MaterializeOptions): Pr
       .in('status', ['queued', 'running'])
       .limit(1)
     if (!existingTask.data?.length) {
-      await supabase.from('generation_tasks').insert({
+      const { data: queuedTask } = await supabase.from('generation_tasks').insert({
         order_id: orderId,
         kind: 'i23d',
         provider: 'worker',
@@ -250,9 +252,22 @@ export async function materializeSelectedImages(options: MaterializeOptions): Pr
           imageIds: fallbackViews.map((v) => v.imageId),
           imageViews: fallbackViews,
         },
+      }).select('id').single()
+      await lifecycle.recordProviderTaskQueued({
+        supabase,
+        orderId,
+        actor,
+        idempotencyKey: `${idempotencyKeys.materialization(orderId, fallbackViews.map((v) => v.imageId), process.env.I23D_PROVIDER || 'worker')}:provider-task`,
+        metadata: { task_id: queuedTask?.id || null, provider: 'worker', fallback: true },
       })
     }
-    await supabase.from('orders').update({ status: 'materializing' }).eq('id', orderId)
+    await lifecycle.selectImageForMaterialization({
+      supabase,
+      orderId,
+      actor,
+      idempotencyKey: `${idempotencyKeys.materialization(orderId, fallbackViews.map((v) => v.imageId), process.env.I23D_PROVIDER || 'worker')}:select`,
+      metadata: { image_count: fallbackViews.length, fallback: true },
+    })
     await supabase
       .from('order_events')
       .insert({ order_id: orderId, phase: 'materializing', message: `Selected ${fallbackViews.length} image(s) (remote fallback)` })
@@ -291,7 +306,7 @@ export async function materializeSelectedImages(options: MaterializeOptions): Pr
     .in('status', ['queued', 'running'])
     .limit(1)
   if (!existingTask.data?.length) {
-    await supabase.from('generation_tasks').insert({
+    const { data: queuedTask } = await supabase.from('generation_tasks').insert({
       order_id: orderId,
       kind: 'i23d',
       provider: 'worker',
@@ -301,10 +316,23 @@ export async function materializeSelectedImages(options: MaterializeOptions): Pr
         imageIds: uploaded.map((u) => u.id),
         imageViews: uploaded.map((u) => ({ imageId: u.id, assetUrl: u.assetUrl, viewRole: u.viewRole || null })),
       },
+    }).select('id').single()
+    await lifecycle.recordProviderTaskQueued({
+      supabase,
+      orderId,
+      actor,
+      idempotencyKey: `${idempotencyKeys.materialization(orderId, uploaded.map((u) => u.id), process.env.I23D_PROVIDER || 'worker')}:provider-task`,
+      metadata: { task_id: queuedTask?.id || null, provider: 'worker', fallback: false },
     })
   }
 
-  await supabase.from('orders').update({ status: 'materializing' }).eq('id', orderId)
+  await lifecycle.selectImageForMaterialization({
+    supabase,
+    orderId,
+    actor,
+    idempotencyKey: `${idempotencyKeys.materialization(orderId, uploaded.map((u) => u.id), process.env.I23D_PROVIDER || 'worker')}:select`,
+    metadata: { image_count: uploaded.length, fallback: false },
+  })
   await supabase
     .from('order_events')
     .insert({ order_id: orderId, phase: 'materializing', message: `Selected ${uploaded.length} image(s)` })

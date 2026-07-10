@@ -9,6 +9,7 @@ import { getEditProvider } from '@/lib/providers/edit'
 import { materializeSelectedImages } from '@/lib/materialize'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { idempotencyKeys, lifecycle } from '@/lib/lifecycle'
 
 export const runtime = 'nodejs'
 
@@ -90,8 +91,11 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'not_authenticated' }, { status })
     }
     const supabase = createAdminClient()
-    const { orderId, message } = (await req.json().catch(() => ({}))) as { orderId?: string; message?: string }
+    const body = (await req.json().catch(() => ({}))) as { orderId?: string; message?: string }
+    const orderId = String(body.orderId || '')
+    const message = body.message
     if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 })
+    const activeOrderId = orderId
     if (!message || typeof message !== 'string') return NextResponse.json({ error: 'message required' }, { status: 400 })
     try {
       await requireOrderAccess(supabase, orderId, auth, 'id,user_id,status')
@@ -308,7 +312,13 @@ export async function POST(req: Request) {
             .select('id,url,meta_json')
           if (insertErr) throw insertErr
 
-          await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+          await lifecycle.recordVisualizationSucceeded({
+            supabase,
+            orderId: activeOrderId,
+            actor: 'chat',
+            idempotencyKey: `order:${activeOrderId}:visualize:attachment_promote:${resolved.map((row: any) => row.id).join(',')}`,
+            metadata: { source: 'attachment_promote', count: insertRows.length },
+          })
           try {
             await supabase.from('order_events').insert({
               order_id: orderId,
@@ -349,7 +359,13 @@ export async function POST(req: Request) {
               if (imageUrls && imageUrls.length) {
                 const rows = imageUrls.map((url) => ({ order_id: orderId, kind: 'candidate', url, meta_json: { prompt: message, style } }))
                 const { data: inserted } = await supabase.from('images').insert(rows).select('id,url')
-                await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+                await lifecycle.recordVisualizationSucceeded({
+                  supabase,
+                  orderId: activeOrderId,
+                  actor: 'chat',
+                  idempotencyKey: idempotencyKeys.visualization(activeOrderId, (message || '').toString(), style, n),
+                  metadata: { source: 'chat_fallback', count: inserted?.length || 0 },
+                })
                 const cardImages = [] as any[]
                 for (const r of inserted || []) {
                   const canonical = normalizeSupabaseUrl(r.url) || r.url
@@ -394,7 +410,7 @@ export async function POST(req: Request) {
             try { snap = await buildContextSnapshot(orderId, { maxImages, maxAngles }) } catch {}
             if (snap) {
               messages = [
-                { role: 'system', content: `FACTS: ${JSON.stringify({ status: snap.status, quote: snap.quote, selected_image_id: snap.selected_image_id, chosen_index: snap.chosen_index, images: (snap.images||[]).map(x=>x.id).slice(0, maxImages), angles: (snap.angles||[]).map(a=>({ parent_image_id:a.parent_image_id, parent_index:a.parent_index||null, labels:a.labels, image_ids:a.image_ids })), last_angles_parent_id: snap.last_angles_parent_id||null, has_stl: !!snap.geometry?.stl_url })}` },
+                { role: 'system', content: `FACTS: ${JSON.stringify({ status: snap.status, quote: snap.quote, selected_image_id: snap.selected_image_id, chosen_index: snap.chosen_index, images: (snap.images||[]).map((x: any)=>x.id).slice(0, maxImages), angles: (snap.angles||[]).map((a: any)=>({ parent_image_id:a.parent_image_id, parent_index:a.parent_index||null, labels:a.labels, image_ids:a.image_ids })), last_angles_parent_id: snap.last_angles_parent_id||null, has_stl: !!snap.geometry?.stl_url })}` },
                 ...messages,
               ]
             }
@@ -477,8 +493,9 @@ export async function POST(req: Request) {
           } catch {}
           const prompt: string = (args?.prompt || message || '').toString()
           const style = args?.style
+          const n = 2
           const provider = getT2IProvider(process.env.T2I_PROVIDER)
-          const { imageUrls } = await provider.generateImages({ prompt, n: 2, style })
+          const { imageUrls } = await provider.generateImages({ prompt, n, style })
           // Mirror to storage for reliability
           const bucket = process.env.SUPABASE_STORAGE_BUCKET || 'artifacts'
           try { await ensureStorageBucket(bucket) } catch {}
@@ -502,7 +519,13 @@ export async function POST(req: Request) {
             .insert(rows)
             .select('id,url')
           if (error) throw error
-          await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+          await lifecycle.recordVisualizationSucceeded({
+            supabase,
+            orderId: activeOrderId,
+            actor: 'chat',
+            idempotencyKey: idempotencyKeys.visualization(activeOrderId, prompt, style, n),
+            metadata: { source: 'visualize_generate', count: inserted?.length || 0 },
+          })
           const indexed = [] as any[]
           for (let i = 0; i < (inserted || []).length; i++) {
             const row = inserted![i]
@@ -604,7 +627,13 @@ export async function POST(req: Request) {
             .insert(rows)
             .select('id,url')
           if (insertErr) throw insertErr
-          await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+          await lifecycle.recordVisualizationSucceeded({
+            supabase,
+            orderId: activeOrderId,
+            actor: 'chat',
+            idempotencyKey: `order:${activeOrderId}:visualize:attachment_edit:${assetRow.id}:${prompt}`,
+            metadata: { source: 'attachment_edit', count: inserted?.length || 0 },
+          })
           try {
             await supabase.from('order_events').insert({
               order_id: orderId,
@@ -802,7 +831,8 @@ export async function POST(req: Request) {
           const enableQuickMesh = ['1', 'true', 'yes', 'on'].includes(String(process.env.WEB_I23D_FALLBACK || '0').trim().toLowerCase())
           const result = await materializeSelectedImages({
             supabase,
-            orderId,
+            orderId: activeOrderId,
+            actor: 'chat',
             imageIds: inputIds,
             imageUrls: inputUrls,
             enableQuickMesh,
@@ -907,7 +937,13 @@ export async function POST(req: Request) {
           const rows = mirrored2.map((it) => ({ order_id: orderId, kind: 'candidate', url: it.url, meta_json: { parent_image_id: imgRow.id, edit_prompt: prompt, provider: 'nano-banana', description: description || null } }))
           const { data: inserted, error } = await supabase.from('images').insert(rows).select('id,url')
           if (error) throw error
-          await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+          await lifecycle.recordVisualizationSucceeded({
+            supabase,
+            orderId,
+            actor: 'chat',
+            idempotencyKey: `order:${activeOrderId}:visualize:concept_edit:${imgRow.id}:${prompt}`,
+            metadata: { source: 'concept_edit', count: inserted?.length || 0 },
+          })
           await supabase.from('order_events').insert({ order_id: orderId, phase: 'visualizing', message: `Edited concept`, meta_json: { parent_image_id: imgRow.id, n } })
           const images = [] as any[]
           for (const r of inserted || []) {
@@ -953,17 +989,24 @@ export async function POST(req: Request) {
           } catch {}
           const { data: orderRow } = await supabase.from('orders').select('status').eq('id', orderId).single()
           const status = (orderRow?.status ?? null) as string | null
-          const busy = new Set(['fabrication_requested','repairing','slicing','stl_ready','ready_to_pay','paid','dispatching','printing'])
+          const busy = new Set(['stabilizing','slicing','ready_to_pay','paid','dispatching','printing'])
           if (status && busy.has(status)) {
             return { ok: true, status }
           }
-          await supabase.from('orders').update({ status: 'fabrication_requested', worker_id: null, locked_at: null }).eq('id', orderId)
-          await supabase.from('order_events').insert({ order_id: orderId, phase: 'fabrication_requested', message: 'Assistant requested fabrication' })
+          await lifecycle.requestStabilization({
+            supabase,
+            orderId: activeOrderId,
+            actor: 'chat',
+            idempotencyKey: `order:${activeOrderId}:stabilize:chat:fabricate`,
+            metadata: { source: 'chat_tool' },
+          })
+          await supabase.from('orders').update({ worker_id: null, locked_at: null }).eq('id', orderId)
+          await supabase.from('order_events').insert({ order_id: orderId, phase: 'stabilizing', message: 'Assistant requested fabrication' })
           try {
             await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: 'On it — stabilizing the mesh for a print-ready quote.' } })
           } catch {}
           send({ role: 'assistant', type: 'text', content: { text: 'On it — stabilizing the mesh for a print-ready quote.' } })
-          return { ok: true, status: 'fabrication_requested' }
+          return { ok: true, status: 'stabilizing' }
         }
 
         async function adapter_slice_and_quote(args: any) {
@@ -990,8 +1033,15 @@ export async function POST(req: Request) {
           if (!stlUrl) {
             return await adapter_fabricate(args)
           }
-          await supabase.from('orders').update({ status: 'fabrication_requested', worker_id: null, locked_at: null }).eq('id', orderId)
-          await supabase.from('order_events').insert({ order_id: orderId, phase: 'fabrication_requested', message: 'Slice requested with STL', meta_json: { stlUrl } })
+          await lifecycle.requestStabilization({
+            supabase,
+            orderId: activeOrderId,
+            actor: 'chat',
+            idempotencyKey: `order:${activeOrderId}:stabilize:chat:slice_and_quote`,
+            metadata: { source: 'chat_tool', stlUrl },
+          })
+          await supabase.from('orders').update({ worker_id: null, locked_at: null }).eq('id', orderId)
+          await supabase.from('order_events').insert({ order_id: orderId, phase: 'stabilizing', message: 'Slice requested with STL', meta_json: { stlUrl } })
           try {
             await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: 'Slicing the provided STL with the Bambu profile.' } })
           } catch {}
@@ -1051,7 +1101,14 @@ export async function POST(req: Request) {
             throw new Error('no_mesh_available')
           }
 
-          await supabase.from('orders').update({ status: 'fabrication_requested', worker_id: null, locked_at: null }).eq('id', orderId)
+          await lifecycle.requestStabilization({
+            supabase,
+            orderId: activeOrderId,
+            actor: 'chat',
+            idempotencyKey: `order:${activeOrderId}:stabilize:chat:repair`,
+            metadata: { requested_by: 'chat', intent: 'repair' },
+          })
+          await supabase.from('orders').update({ worker_id: null, locked_at: null }).eq('id', orderId)
           try {
             await supabase.from('order_events').insert({ order_id: orderId, phase: 'fabrication_requested', message: 'Repair requested via chat tool', meta_json: { requested_by: 'chat', intent: 'repair' } })
           } catch {}
@@ -1061,7 +1118,7 @@ export async function POST(req: Request) {
           const txt = 'Stabilizing the mesh — I’ll drop the repaired STL here once it passes checks.'
           try { await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: txt } }) } catch {}
           send({ role: 'assistant', type: 'text', content: { text: txt } })
-          return { ok: true, status: 'fabrication_requested' }
+          return { ok: true, status: 'stabilizing' }
         }
 
         async function adapter_dispatch_print(args: any) {
@@ -1088,11 +1145,25 @@ export async function POST(req: Request) {
           const currentStatus = orderRow?.status || null
 
           if (currentStatus !== 'printing') {
-            await supabase.from('orders').update({ status: 'dispatching', worker_id: null, locked_at: null }).eq('id', orderId)
+            await lifecycle.requestDispatch({
+              supabase,
+              orderId: activeOrderId,
+              actor: 'chat',
+              idempotencyKey: idempotencyKeys.dispatch(activeOrderId, canonicalThreeMf),
+              metadata: { source: 'chat_tool', link },
+            })
+            await supabase.from('orders').update({ worker_id: null, locked_at: null }).eq('id', orderId)
             try {
               await supabase.from('order_events').insert({ order_id: orderId, phase: 'dispatching', message: 'Dispatch link issued (chat)', meta_json: { link } })
             } catch {}
-            await supabase.from('orders').update({ status: 'printing', worker_id: null, locked_at: null }).eq('id', orderId)
+            await lifecycle.recordPrintingStarted({
+              supabase,
+              orderId: activeOrderId,
+              actor: 'chat',
+              idempotencyKey: `${idempotencyKeys.dispatch(activeOrderId, canonicalThreeMf)}:printing`,
+              metadata: { source: 'chat_tool' },
+            })
+            await supabase.from('orders').update({ worker_id: null, locked_at: null }).eq('id', orderId)
             try {
               await supabase.from('order_events').insert({ order_id: orderId, phase: 'printing', message: 'Awaiting operator print' })
             } catch {}

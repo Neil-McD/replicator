@@ -3,6 +3,7 @@ import { createAdminClient, ensureStorageBucket, signedUrlOrDirect, signedUrlWit
 import { getT2IProvider } from '@/lib/providers/t2i'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { idempotencyKeys, lifecycle } from '@/lib/lifecycle'
 
 export const runtime = 'nodejs'
 
@@ -46,6 +47,15 @@ export async function POST(req: Request) {
       await supabase.from('order_events').insert({ order_id: orderId, phase: 'needs_review', message: 'Blocked by moderation guard (visualize)' })
       return NextResponse.json({ error: 'prompt_blocked' }, { status: 400 })
     }
+
+    const visualizeKey = idempotencyKeys.visualization(orderId, prompt, style, n)
+    await lifecycle.requestVisualization({
+      supabase,
+      orderId,
+      actor: auth.user?.id || 'user',
+      idempotencyKey: `${visualizeKey}:request`,
+      metadata: { prompt, style: style || null, n },
+    })
 
     // Generate N concepts via T2I provider (default: 2)
     const provider = getT2IProvider(process.env.T2I_PROVIDER)
@@ -111,7 +121,13 @@ export async function POST(req: Request) {
         n: indexed.length,
       },
     })
-    await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+    await lifecycle.recordVisualizationSucceeded({
+      supabase,
+      orderId,
+      actor: auth.user?.id || 'user',
+      idempotencyKey: `${visualizeKey}:succeeded`,
+      metadata: { image_count: inserted?.length || 0 },
+    })
     await supabase.from('order_events').insert({ order_id: orderId, phase: 'visualizing', message: `Generated ${inserted?.length || 0} candidates` })
 
     return NextResponse.json({ images: inserted || [], message: 'ok' })

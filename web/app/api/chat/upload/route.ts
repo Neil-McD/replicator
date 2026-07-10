@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { createAdminClient, ensureStorageBucket, signedUrlWithInfo, normalizeSupabaseUrl } from '@/lib/supabaseAdmin'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { lifecycle } from '@/lib/lifecycle'
 
 export const runtime = 'nodejs'
 
@@ -92,7 +93,13 @@ export async function POST(req: Request) {
     }
 
     if (attachments.length) {
-      await supabase.from('orders').update({ status: 'visualizing' }).eq('id', orderId)
+      await lifecycle.requestVisualization({
+        supabase,
+        orderId,
+        actor: auth.user?.id || 'user',
+        idempotencyKey: `order:${orderId}:visualize:chat_upload:${attachments.map((a) => a.asset_id).join(',')}`,
+        metadata: { source: 'chat_upload', count: attachments.length },
+      })
       await supabase.from('order_events').insert({
         order_id: orderId,
         phase: 'visualizing',

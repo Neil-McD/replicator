@@ -4,6 +4,7 @@ import { getEditProvider } from '@/lib/providers/edit'
 import { mirrorRemoteImageToStorage } from '@/lib/storage'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { lifecycle } from '@/lib/lifecycle'
 
 export const runtime = 'nodejs'
 
@@ -152,7 +153,13 @@ export async function POST(req: Request) {
       .from('chat_messages')
       .insert({ order_id: orderId, role: 'assistant', type: 'card.images', content_json: { group: 'angles', parent_image_id: imageId, images, n: images.length } })
     await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: 'More angles ready. You can materialize them all or pick one.' } })
-    await supabase.from('orders').update({ status: 'await_image_pick' }).eq('id', orderId)
+    await lifecycle.recordVisualizationSucceeded({
+      supabase,
+      orderId,
+      actor: auth.user?.id || 'user',
+      idempotencyKey: `order:${orderId}:visualize:angles:${imageId}:${requested.join(',')}`,
+      metadata: { source: 'angles', parent_image_id: imageId, n: images.length },
+    })
     try {
       await supabase.from('order_events').insert({ order_id: orderId, phase: 'visualizing', message: 'Angles generated', meta_json: { parent_image_id: imageId, n: images.length, duration_ms: Date.now() - t0 } })
     } catch {}
