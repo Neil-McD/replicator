@@ -34,7 +34,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     await lifecycle.requestStabilization({
       supabase,
       orderId,
-      actor: auth.user?.id || null,
+      actor: auth.user?.id || 'user',
       idempotencyKey: `order:${orderId}:stabilize:fabricate`,
       metadata: { source: 'fabricate_route' },
     })

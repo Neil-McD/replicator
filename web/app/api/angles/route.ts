@@ -156,7 +156,7 @@ export async function POST(req: Request) {
     await lifecycle.recordVisualizationSucceeded({
       supabase,
       orderId,
-      actor: auth.user?.id || null,
+      actor: auth.user?.id || 'user',
       idempotencyKey: `order:${orderId}:visualize:angles:${imageId}:${requested.join(',')}`,
       metadata: { source: 'angles', parent_image_id: imageId, n: images.length },
     })

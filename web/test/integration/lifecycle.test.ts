@@ -44,6 +44,15 @@ class LifecycleStubSupabase {
       }
 
       maybeSingle() {
+        if (table === 'orders' && this.payload?.status) {
+          const expected = this.filters.find((f) => f.column === 'status' && f.op === 'eq')?.value
+          if (expected && expected !== self.orderStatus) {
+            return Promise.resolve({ data: null, error: null })
+          }
+          self.orderStatus = this.payload.status
+          self.updates.push({ table, payload: this.payload, filters: this.filters })
+          return Promise.resolve({ data: { id: 'order-1', status: self.orderStatus }, error: null })
+        }
         if (table !== 'order_commands') return Promise.resolve({ data: null, error: null })
         const key = this.filters.find((f) => f.column === 'key')?.value
         return Promise.resolve({ data: self.commands.get(key) || null, error: null })
@@ -63,8 +72,11 @@ class LifecycleStubSupabase {
 
       async then(resolve: any) {
         if (table === 'orders' && this.payload?.status) {
-          self.orderStatus = this.payload.status
-          self.updates.push({ table, payload: this.payload, filters: this.filters })
+          const expected = this.filters.find((f) => f.column === 'status' && f.op === 'eq')?.value
+          if (!expected || expected === self.orderStatus) {
+            self.orderStatus = this.payload.status
+            self.updates.push({ table, payload: this.payload, filters: this.filters })
+          }
         }
         resolve({ data: null, error: null })
       }
@@ -121,4 +133,60 @@ test('lifecycle command idempotency returns original result for duplicate comman
   })
   assert.equal(second.reused, true)
   assert.equal(supabase.updates.length, 1)
+})
+
+test('lifecycle command requires actor and idempotency key', async () => {
+  const supabase = new LifecycleStubSupabase('ready_to_pay') as any
+  await assert.rejects(
+    lifecycle.authorizePayment({
+      supabase,
+      orderId: 'order-1',
+      actor: '',
+      idempotencyKey: 'order:order-1:payment:missing-actor',
+    }),
+    /missing_actor:authorizePayment/,
+  )
+  await assert.rejects(
+    lifecycle.authorizePayment({
+      supabase,
+      orderId: 'order-1',
+      actor: 'stripe',
+      idempotencyKey: '',
+    }),
+    /missing_idempotency_key:authorizePayment/,
+  )
+})
+
+test('lifecycle command validates current status atomically on update', async () => {
+  const supabase = new LifecycleStubSupabase('ready_to_pay') as any
+  const originalSingle = supabase.from('orders').single
+  let changedAfterRead = false
+  const originalFrom = supabase.from.bind(supabase)
+  supabase.from = (table: string) => {
+    const builder = originalFrom(table)
+    if (table === 'orders') {
+      const baseSingle = builder.single.bind(builder)
+      builder.single = async () => {
+        const result = await baseSingle()
+        if (!changedAfterRead) {
+          changedAfterRead = true
+          supabase.orderStatus = 'cancelled'
+        }
+        return result
+      }
+    }
+    return builder
+  }
+  await assert.rejects(
+    lifecycle.authorizePayment({
+      supabase,
+      orderId: 'order-1',
+      actor: 'stripe',
+      idempotencyKey: 'order:order-1:payment:stale',
+    }),
+    /stale_transition:ready_to_pay:authorizePayment:paid/,
+  )
+  assert.equal(supabase.orderStatus, 'cancelled')
+  assert.equal(supabase.updates.length, 0)
+  void originalSingle
 })

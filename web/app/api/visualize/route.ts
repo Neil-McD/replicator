@@ -52,7 +52,7 @@ export async function POST(req: Request) {
     await lifecycle.requestVisualization({
       supabase,
       orderId,
-      actor: auth.user?.id || null,
+      actor: auth.user?.id || 'user',
       idempotencyKey: `${visualizeKey}:request`,
       metadata: { prompt, style: style || null, n },
     })
@@ -124,7 +124,7 @@ export async function POST(req: Request) {
     await lifecycle.recordVisualizationSucceeded({
       supabase,
       orderId,
-      actor: auth.user?.id || null,
+      actor: auth.user?.id || 'user',
       idempotencyKey: `${visualizeKey}:succeeded`,
       metadata: { image_count: inserted?.length || 0 },
     })

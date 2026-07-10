@@ -1431,12 +1431,10 @@ def _claim_backoff_reset():
 
 
 def claim_next_order() -> Optional[Dict[str, Any]]:
-    """Claim the next actionable order.
+    """Claim the next provider order from generation_tasks.
 
-    Priority:
-    1) Orders with a queued i23d generation_task (created by /api/materialize)
-    2) Orders with status='new' that have at least one 'upload_image' asset
-    3) (Last resort) Old behavior via RPC or first 'new' order
+    Repair, export, slice, and dispatch work is owned by export_jobs. This
+    function intentionally does not poll orders.status as a production queue.
     """
     _claim_backoff_wait()
     # 0) Prefer queued i23d tasks via atomic RPC
@@ -1477,87 +1475,6 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
-    # 2) Orders explicitly marked for slicing (user requested quote)
-    try:
-        slicing = supabase_get("orders", {"status": "eq.slicing", "order": "created_at.asc", "limit": 1}) or []
-        if slicing:
-            o = slicing[0]
-            oid = o.get("id")
-            if oid:
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
-                _claim_backoff_reset()
-                return o
-    except Exception:
-        pass
-
-    # 2a) Canonical stabilization requested (repair + slice pipeline)
-    try:
-        fab = supabase_get("orders", {"status": "eq.stabilizing", "order": "created_at.asc", "limit": 1}) or []
-        if fab:
-            o = fab[0]
-            oid = o.get("id")
-            if oid:
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
-                _claim_backoff_reset()
-                return o
-    except Exception:
-        pass
-
-    # 2b) Legacy compatibility only: pre-lifecycle rows may still be marked exporting.
-    try:
-        exporting = supabase_get("orders", {"status": "eq.exporting", "order": "created_at.asc", "limit": 1}) or []
-        if exporting:
-            o = exporting[0]
-            oid = o.get("id")
-            if oid:
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
-                _claim_backoff_reset()
-                return o
-    except Exception:
-        pass
-
-    # 3) Orders with user-uploaded assets present (image or 3D model)
-    try:
-        # Consider up to N recent 'new' orders to avoid scanning entire table
-        candidates = supabase_get("orders", {"status": "eq.new", "order": "created_at.asc", "limit": 25}) or []
-        for o in candidates:
-            oid = o.get("id")
-            try:
-                ups = list_uploads(oid)
-            except Exception:
-                ups = []
-            has_image = any((u.get("kind") == "upload_image") for u in ups)
-            has_model = any((u.get("kind") in ("upload_stl","upload_obj","upload_glb")) for u in ups)
-            if has_image or has_model:
-                transition_order_status(oid, "selectImageForMaterialization", "materializing")
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
-                _claim_backoff_reset()
-                return o
-    except Exception:
-        pass
-
-    # 4) Fallback: atomic RPC (if present) — only accept if order has assets we can use
-    try:
-        claimed = supabase_rpc("claim_next_order", {"p_worker_id": WORKER_ID})
-        if claimed and isinstance(claimed, dict) and claimed.get("id"):
-            oid = claimed.get("id")
-            ups = []
-            try:
-                ups = list_uploads(oid)
-            except Exception:
-                ups = []
-            has_model = any(u.get("kind") in ("upload_stl","upload_obj","upload_glb") for u in ups)
-            has_image = any(u.get("kind") == "upload_image" for u in ups)
-            if has_model or has_image:
-                _claim_backoff_reset()
-                return claimed
-            # No useful assets — set back to new and skip
-            try:
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"status": "new", "worker_id": None, "locked_at": None})
-            except Exception:
-                pass
-    except Exception:
-        pass
     # No suitable orders
     return None
 
@@ -1608,6 +1525,42 @@ WORKER_TRANSITION_COMMANDS = {
     "cancelled": "cancelOrder",
 }
 
+ACTIVE_ORDER_STATUSES = {
+    "new",
+    "visualizing",
+    "await_image_pick",
+    "materializing",
+    "stabilizing",
+    "slicing",
+    "ready_to_pay",
+    "paid",
+    "dispatching",
+    "printing",
+}
+
+WORKER_TRANSITIONS = {
+    "requestVisualization": ({"new", "await_image_pick", "generate_failed", "needs_review"}, "visualizing"),
+    "recordVisualizationSucceeded": ({"new", "visualizing", "await_image_pick"}, "await_image_pick"),
+    "selectImageForMaterialization": ({"await_image_pick", "generate_failed", "needs_review"}, "materializing"),
+    "recordProviderTaskSucceeded": ({"materializing"}, "stabilizing"),
+    "recordProviderTaskFailed": ({"visualizing", "materializing"}, "generate_failed"),
+    "requestStabilization": ({"new", "await_image_pick", "materializing", "stabilizing", "ready_to_pay", "repair_failed", "needs_review"}, "stabilizing"),
+    "recordRepairSucceeded": ({"stabilizing"}, "slicing"),
+    "recordRepairFailed": ({"stabilizing"}, "repair_failed"),
+    "requestSliceQuote": ({"stabilizing", "ready_to_pay", "slice_failed", "needs_review"}, "slicing"),
+    "recordSliceQuoteSucceeded": ({"slicing"}, "ready_to_pay"),
+    "recordSliceQuoteFailed": ({"slicing"}, "slice_failed"),
+    "authorizePayment": ({"ready_to_pay"}, "paid"),
+    "requestDispatch": ({"ready_to_pay", "paid", "dispatch_failed"}, "dispatching"),
+    "recordDispatchIssued": ({"dispatching"}, "dispatching"),
+    "recordPrintingStarted": ({"dispatching"}, "printing"),
+    "recordPrintDone": ({"printing"}, "done"),
+    "cancelOrder": (ACTIVE_ORDER_STATUSES, "cancelled"),
+    # Worker review is a controlled failure/review transition, not a second lifecycle.
+    "workerNeedsReview": ({"new", "visualizing", "await_image_pick", "materializing", "stabilizing", "slicing", "ready_to_pay", "dispatching"}, "needs_review"),
+    "recordDispatchFailed": ({"dispatching", "paid"}, "dispatch_failed"),
+}
+
 
 def normalize_order_status(status: Any) -> str:
     raw = str(status or "new").strip()
@@ -1615,17 +1568,71 @@ def normalize_order_status(status: Any) -> str:
         return raw
     return DEPRECATED_ORDER_STATUS_MAP.get(raw, "needs_review")
 
+def _transition_idempotency_key(order_id: str, command: str, target_status: str, metadata: Optional[Dict[str, Any]]) -> str:
+    if isinstance(metadata, dict) and metadata.get("idempotency_key"):
+        return str(metadata.get("idempotency_key"))
+    raw = json.dumps(metadata or {}, sort_keys=True, default=str)
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"worker:{order_id}:{command}:{target_status}:{digest}"
+
+
+def _record_order_command(order_id: str, command: str, key: str, status: str, metadata: Optional[Dict[str, Any]], result: Optional[Dict[str, Any]] = None):
+    try:
+        existing = supabase_get("order_commands", {"key": f"eq.{key}", "select": "key,status", "limit": 1}) or []
+        if existing:
+            supabase_patch("order_commands", {"key": f"eq.{key}"}, {
+                "status": status,
+                "actor": "worker",
+                "metadata_json": metadata or {},
+                "result_json": result or {},
+                "updated_at": now_iso(),
+            })
+            return
+        supabase_insert("order_commands", {
+            "key": key,
+            "command": command,
+            "order_id": order_id,
+            "status": status,
+            "actor": "worker",
+            "metadata_json": metadata or {},
+            "result_json": result or {},
+            "updated_at": now_iso(),
+        })
+    except Exception:
+        # Older deployments may not have order_commands yet; transition validation still applies.
+        pass
+
 
 def transition_order_status(order_id: str, command: str, target_status: str, metadata: Optional[Dict[str, Any]] = None):
     target_status = normalize_order_status(target_status)
-    if target_status not in CANONICAL_ORDER_STATUSES:
-        target_status = "needs_review"
-    params: Dict[str, Any] = {"id": f"eq.{order_id}"}
-    # Do not overwrite a client-requested cancellation with later worker updates.
-    if target_status.lower() != "cancelled":
-        params["status"] = "neq.cancelled"
+    rule = WORKER_TRANSITIONS.get(command)
+    if not rule or rule[1] != target_status:
+        log(f"[status] illegal worker command target {command}->{target_status}", level="warning", order_id=order_id)
+        return
+    key = _transition_idempotency_key(order_id, command, target_status, metadata)
+    rows = supabase_get("orders", {"id": f"eq.{order_id}", "select": "id,status", "limit": 1}) or []
+    if not rows:
+        log(f"[status] order not found for transition {command}", level="warning", order_id=order_id)
+        return
+    current_raw = str(rows[0].get("status") or "new")
+    current = normalize_order_status(current_raw)
+    allowed_from, _ = rule
+    if current == target_status:
+        _record_order_command(order_id, command, key, "succeeded", metadata, {"status": target_status, "noop": True})
+        return
+    if current not in allowed_from:
+        _record_order_command(order_id, command, key, "failed", metadata, {"error": f"invalid_transition:{current}:{command}:{target_status}"})
+        log(f"[status] invalid transition {current}:{command}->{target_status}", level="warning", order_id=order_id)
+        return
+    _record_order_command(order_id, command, key, "started", metadata)
+    params: Dict[str, Any] = {"id": f"eq.{order_id}", "status": f"eq.{current_raw}"}
     try:
-        supabase_patch("orders", params, {"status": target_status})
+        updated = supabase_patch("orders", params, {"status": target_status})
+        if isinstance(updated, list) and not updated:
+            _record_order_command(order_id, command, key, "failed", metadata, {"error": "stale_status"})
+            log(f"[status] stale transition {current}:{command}->{target_status}", level="warning", order_id=order_id)
+            return
+        _record_order_command(order_id, command, key, "succeeded", metadata, {"status": target_status})
         try:
             supabase_insert("order_events", {
                 "order_id": order_id,
@@ -2079,7 +2086,6 @@ def complete_export_job(job: Dict[str, Any], asset: Dict[str, Any], orient_summa
         asset_id=asset.get('id'),
         target_mm=target_mm,
     )
-    set_status(order_id, 'stl_ready')
     record_order_event(
         order_id,
         'export_done',
@@ -2146,6 +2152,10 @@ def process_export_job(job: Dict[str, Any]) -> bool:
 
     if job_type in ('slice_quote', 'slice'):
         return _process_slice_job(job)
+    elif job_type == 'repair':
+        return _process_repair_job(job)
+    elif job_type == 'dispatch':
+        return _process_dispatch_job(job)
     elif job_type in ('export_stl', 'export'):
         return _process_sized_export_job(job)
     else:
@@ -2155,6 +2165,94 @@ def process_export_job(job: Dict[str, Any]) -> bool:
             order_id=job.get('order_id')
         )
         fail_export_job(job, f'Unknown job_type: {job_type}')
+        return True
+
+
+def _process_repair_job(job: Dict[str, Any]) -> bool:
+    order_id = job.get('order_id')
+    job_id = job.get('id')
+    if not order_id or not job_id:
+        return False
+    if _skip_if_cancelled(order_id, 'repair_job'):
+        mark_export_job(job_id, {'status': 'cancelled', 'completed_at': now_iso(), 'worker_id': WORKER_ID})
+        return True
+    try:
+        order = reload_order(order_id) or {'id': order_id}
+        raw_asset = latest_raw_mesh_asset(order_id)
+        if not raw_asset or not raw_asset.get('url'):
+            raise RuntimeError('No raw mesh available for repair')
+        before = latest_asset(order_id, 'repaired_stl')
+        auto_stabilize_mesh(order, str(raw_asset.get('kind') or 'raw_mesh'), str(raw_asset.get('url')), [raw_asset])
+        after = latest_asset(order_id, 'repaired_stl')
+        if not after or (before and before.get('id') == after.get('id')):
+            raise RuntimeError('repair did not produce a new repaired_stl asset')
+        mark_export_job(job_id, {
+            'status': 'succeeded',
+            'asset_id': after.get('id'),
+            'completed_at': now_iso(),
+            'worker_id': WORKER_ID,
+            'meta_json': _merge_dict(job.get('meta_json'), {'produced_asset_id': after.get('id'), 'sha256': after.get('sha256')}),
+        })
+        return True
+    except Exception as exc:
+        mark_export_job(job_id, {
+            'status': 'failed',
+            'error_message': str(exc)[:400],
+            'completed_at': now_iso(),
+            'worker_id': WORKER_ID,
+        })
+        set_status(order_id, 'repair_failed')
+        record_order_event(order_id, 'repair_failed', str(exc)[:200], severity='error', meta={'job_id': job_id})
+        return True
+
+
+def _process_dispatch_job(job: Dict[str, Any]) -> bool:
+    order_id = job.get('order_id')
+    job_id = job.get('id')
+    if not order_id or not job_id:
+        return False
+    if _skip_if_cancelled(order_id, 'dispatch_job'):
+        mark_export_job(job_id, {'status': 'cancelled', 'completed_at': now_iso(), 'worker_id': WORKER_ID})
+        return True
+    try:
+        three_mf = latest_asset(order_id, "three_mf")
+        if not three_mf or not three_mf.get("url"):
+            raise RuntimeError("No 3MF available for dispatch")
+        asset_url = three_mf.get("url")
+        parsed = parse_supabase_url(asset_url)
+        expires_at = None
+        signed = asset_url if not parsed else None
+        if parsed:
+            expires_at = int(time.time() * 1000 + SIGNED_URL_TTL_MS)
+            signed = storage_create_signed_url(*parsed)
+            if not signed:
+                expires_at = None
+        if not signed:
+            raise RuntimeError("Failed to sign 3MF URL")
+        link = build_bambu_connect_link(signed)
+        try:
+            supabase_insert("chat_messages", {"order_id": order_id, "role": "assistant", "type": "text", "content_json": {"text": f"Open to print: {link}"}})
+        except Exception:
+            pass
+        mark_export_job(job_id, {
+            'status': 'succeeded',
+            'asset_id': three_mf.get('id'),
+            'completed_at': now_iso(),
+            'worker_id': WORKER_ID,
+            'meta_json': _merge_dict(job.get('meta_json'), {'link': link, 'expires_at': expires_at}),
+        })
+        transition_order_status(order_id, "recordDispatchIssued", "dispatching", {"job_id": job_id, "asset_id": three_mf.get("id")})
+        set_status(order_id, "printing")
+        return True
+    except Exception as exc:
+        mark_export_job(job_id, {
+            'status': 'failed',
+            'error_message': str(exc)[:400],
+            'completed_at': now_iso(),
+            'worker_id': WORKER_ID,
+        })
+        set_status(order_id, "dispatch_failed")
+        record_order_event(order_id, "dispatch_failed", str(exc)[:200], severity='error', meta={'job_id': job_id})
         return True
 
 
@@ -2174,7 +2272,6 @@ def _process_sized_export_job(job: Dict[str, Any]) -> bool:
             order_id=order_id,
             target_mm=target_mm,
         )
-        set_status(order_id, 'exporting')
         if target_mm is None or target_mm <= 0:
             raise RuntimeError('invalid_target_mm')
         rep = latest_asset(order_id, 'repaired_stl')
@@ -4374,8 +4471,8 @@ def auto_stabilize_mesh(order: Dict[str, Any], raw_kind: str, raw_url: str, raw_
     thin_wall_detected = False
     thin_wall_reason: Optional[str] = None
     try:
-        set_status(oid, 'repairing')
-        order['status'] = 'repairing'
+        set_status(oid, 'stabilizing')
+        order['status'] = 'stabilizing'
     except Exception:
         pass
     try:
@@ -4464,8 +4561,12 @@ def auto_stabilize_mesh(order: Dict[str, Any], raw_kind: str, raw_url: str, raw_
         except Exception:
             pass
     try:
-        set_status(oid, 'visualizing')
-        order['status'] = 'visualizing'
+        transition_order_status(oid, 'recordRepairSucceeded', 'slicing', {
+            'raw_asset_id': raw_asset_id,
+            'repaired_asset_id': repaired_asset_id,
+            'repaired_sha256': sha_repaired,
+        })
+        order['status'] = 'slicing'
     except Exception:
         pass
     try:
@@ -4550,6 +4651,27 @@ def auto_stabilize_mesh(order: Dict[str, Any], raw_kind: str, raw_url: str, raw_
             supabase_insert('chat_messages', {'order_id': oid, 'role': 'assistant', 'type': 'warning', 'content_json': {'text': msg}})
         except Exception:
             pass
+    try:
+        existing_slice_jobs = supabase_get("export_jobs", {
+            "order_id": f"eq.{oid}",
+            "job_type": "eq.slice_quote",
+            "status": "in.(pending,processing)",
+            "limit": 1,
+        }) or []
+        if not existing_slice_jobs:
+            supabase_insert("export_jobs", {
+                "order_id": oid,
+                "status": "pending",
+                "job_type": "slice_quote",
+                "meta_json": {
+                    "source": "repair_succeeded",
+                    "repaired_asset_id": repaired_asset_id,
+                    "repaired_sha256": sha_repaired,
+                    "requested_at": now_iso(),
+                },
+            })
+    except Exception as exc:
+        log(f"[repair] failed to enqueue slice job: {exc}", level="warning", order_id=oid)
 
 def _run(cmd: str, timeout_sec: int = 300) -> Tuple[int, str, str]:
     # Echo the exact command for observability
@@ -5313,7 +5435,14 @@ def process_slicing(order: Dict[str, Any]) -> bool:
         three_mf_meta = dict(asset_meta_base)
         three_mf_meta['asset_role'] = 'toolpath'
         attach_asset(oid, "three_mf", three_mf_url, three_mf_sha, three_mf_meta)
-    supabase_patch("orders", {"id": f"eq.{oid}"}, {"quote_json": quote, "status": "ready_to_pay"})
+    supabase_patch("orders", {"id": f"eq.{oid}"}, {"quote_json": quote})
+    transition_order_status(oid, "recordSliceQuoteSucceeded", "ready_to_pay", {
+        "minutes": minutes,
+        "grams": grams,
+        "price_cents": quote.get("price_cents") or quote.get("total_cents"),
+        "three_mf_sha256": three_mf_sha,
+        "preview_sha256": preview_sha,
+    })
     supabase_insert("order_events", {"order_id": oid, "phase": "ready_to_pay", "message": "Quote ready", "meta_json": quote})
     record_domain_event(
         org_id=order.get("org_id"),
@@ -5411,356 +5540,8 @@ def loop_once():
     log(f"Processing order {oid}")
     try:
         status = str(order.get("status") or "")
-        if status == "slicing":
-            execute_slicing_with_retries(order)
-            return True
-
-        if status in ("stabilizing", "fabrication_requested"):
-            if _skip_if_cancelled(oid, "stabilizing"):
-                return True
-            src_ids = _get_selected_image_ids(oid)
-            rep_asset = latest_asset(oid, "repaired_stl")
-            stl_url = rep_asset.get("url") if rep_asset else None
-            ran_repair = False
-            if not stl_url:
-                raw_asset = latest_raw_mesh_asset(oid)
-                raw_url = raw_asset.get("url") if raw_asset else None
-                if not raw_url:
-                    set_status(oid, "needs_review")
-                    supabase_insert("order_events", {"order_id": oid, "phase": "fabrication_failed", "message": "No raw mesh available"})
-                    return True
-                if _skip_if_cancelled(oid, "repairing"):
-                    return True
-                set_status(oid, "repairing")
-                supabase_insert("order_events", {"order_id": oid, "phase": "repairing", "message": "Fabrication requested"})
-                try:
-                    supabase_insert("chat_messages", {"order_id": oid, "role": "assistant", "type": "text", "content_json": {"text": "Stabilizing your mesh for print…"}})
-                except Exception:
-                    pass
-                if _skip_if_cancelled(oid, "repair_start"):
-                    return True
-                repair_out: Optional[Tuple[str, Dict[str, Any], bytes]] = None
-                for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
-                    repair_out = repair(order, raw_url)
-                    if repair_out:
-                        break
-                    log(
-                        "Repair attempt failed",
-                        level='warning',
-                        order_id=oid,
-                        attempt=attempt,
-                        max_attempts=MAX_REPAIR_ATTEMPTS,
-                    )
-                    record_order_event(
-                        oid,
-                        'repair_retry',
-                        'Repair attempt failed',
-                        severity='warning',
-                        meta={'attempt': attempt, 'max_attempts': MAX_REPAIR_ATTEMPTS},
-                    )
-                    if attempt >= MAX_REPAIR_ATTEMPTS:
-                        break
-                    time.sleep(min(STAGE_RETRY_DELAY_S * attempt, STAGE_RETRY_DELAY_S * 3))
-                    refreshed = reload_order(oid)
-                    if refreshed:
-                        order = refreshed
-                    if _skip_if_cancelled(oid, "repairing"):
-                        return True
-                if not repair_out:
-                    log(f"[fabricate] repair() returned no STL for order {oid}", level='error', order_id=oid)
-                    set_status(oid, "repair_failed")
-                    record_order_event(oid, "repair_failed", "Repair pipeline exhausted", severity='error')
-                    return True
-                stl_url, repair_meta, repaired_bytes = repair_out
-                sha_repaired = sha256_bytes(repaired_bytes)
-                ran_repair = True
-                if _skip_if_cancelled(oid, "post_repair"):
-                    return True
-                orient_summary = _orient_summary((repair_meta.get('orient_clamp_final') if isinstance(repair_meta, dict) else None))
-                rep_meta_payload: Dict[str, Any] = {"source_image_ids": src_ids} if src_ids else {}
-                if orient_summary:
-                    rep_meta_payload['orientation'] = orient_summary
-                try:
-                    rep_meta_payload['size_bytes'] = len(repaired_bytes)
-                except Exception:
-                    pass
-                slice_check = validate_slice_bytes(oid, repaired_bytes)
-                if slice_check:
-                    rep_meta_payload['slice_check'] = slice_check
-                _rows_rep = attach_asset(oid, "repaired_stl", stl_url, sha_repaired, (rep_meta_payload or None)) or []
-                try:
-                    if _rows_rep and isinstance(_rows_rep, list):
-                        aid = _rows_rep[0].get("id")
-                        if aid:
-                            merge_order_facts(oid, {"active_mesh_asset_id": aid})
-                except Exception:
-                    pass
-                # Best‑effort: attach a viewer GLB derived from repaired STL for faster viewing
-                try:
-                    rep_asset_id = None
-                    if _rows_rep and isinstance(_rows_rep, list):
-                        rep_asset_id = _rows_rep[0].get('id')
-                    _attach_viewer_glb(oid, repaired_bytes, rep_asset_id, 'repaired_stl', None)
-                except Exception as e:
-                    log(f"[viewer_glb] attach after repair failed: {e}", level='warning', order_id=oid)
-                try:
-                    asset_id = _rows_rep[0].get('id') if _rows_rep and isinstance(_rows_rep, list) else None
-                    parsed = parse_supabase_url(stl_url)
-                    signed = stl_url
-                    expires_at = None
-                    if parsed:
-                        expires_at = int(time.time() * 1000 + SIGNED_URL_TTL_MS)
-                        try:
-                            maybe_signed = storage_create_signed_url(*parsed)
-                            if maybe_signed:
-                                signed = maybe_signed
-                            else:
-                                expires_at = None
-                        except Exception:
-                            signed = stl_url
-                            expires_at = None
-                    if signed:
-                        payload = {
-                            "kind": "stl",
-                            "url": signed,
-                            "asset_id": asset_id,
-                            "asset_kind": "repaired_stl",
-                            "storage_url": stl_url,
-                        }
-                        if expires_at is not None:
-                            payload["expires_at"] = expires_at
-                        supabase_insert("chat_messages", {"order_id": oid, "role": "assistant", "type": "viewer.focus", "content_json": payload})
-                except Exception:
-                    pass
-            summary_parts: List[str] = []
-            if orient_summary:
-                bbox = orient_summary.get('bbox_mm') if isinstance(orient_summary, dict) else None
-                if isinstance(bbox, dict):
-                    try:
-                        sx = float(bbox.get('x') or 0)
-                        sy = float(bbox.get('y') or 0)
-                        sz = float(bbox.get('z') or 0)
-                        if sx and sy and sz:
-                            summary_parts.append(f"Size {round(sx)} × {round(sy)} × {round(sz)} mm")
-                    except Exception:
-                        pass
-            try:
-                summary_parts.append(f"File {round(len(repaired_bytes) / (1024 * 1024), 1)} MB")
-            except Exception:
-                pass
-            if slice_check and isinstance(slice_check, dict):
-                minutes = slice_check.get('minutes')
-                grams = slice_check.get('grams')
-                status = slice_check.get('status')
-                if status == 'ok' and minutes is not None and grams is not None:
-                    summary_parts.append(f"Validation passed · {round(minutes)} min · {round(grams)} g")
-            floating_hint = 0
-            try:
-                floating_hint = int((orient_summary or {}).get('floating_component_count') or 0)
-            except Exception:
-                floating_hint = 0
-            if floating_hint:
-                summary_parts.append(f"Floating regions flagged: {floating_hint}")
-            if src_ids:
-                summary_parts.append('Linked to latest concept selection.')
-            if summary_parts:
-                record_order_event(
-                    oid,
-                    'repair_summary',
-                    'Mesh stabilized summary',
-                    meta={'details': summary_parts},
-                )
-            if thin_wall_detected:
-                warning_text = thin_wall_reason or 'Mesh repair detected thin walls or unit issues. Resize or thicken the model before slicing.'
-                record_order_event(
-                    oid,
-                    'repair_thin_wall',
-                    warning_text,
-                    severity='error',
-                    meta={'slice_check': slice_check},
-                )
-                try:
-                    supabase_insert(
-                        'chat_messages',
-                        {
-                            'order_id': oid,
-                            'role': 'assistant',
-                            'type': 'warning',
-                            'content_json': {'text': warning_text},
-                        },
-                    )
-                except Exception:
-                    pass
-                set_status(oid, 'needs_review')
-                return
-            floating_count_hint = 0
-            try:
-                floating_count_hint = int((orient_summary or {}).get('floating_component_count') or 0)
-            except Exception:
-                floating_count_hint = 0
-            if floating_count_hint > 0:
-                try:
-                    supabase_insert('chat_messages', {'order_id': oid, 'role': 'assistant', 'type': 'warning', 'content_json': {'text': 'Mesh stabilized, but floating regions remain. Review orientation or request supports.'}})
-                except Exception:
-                    pass
-            # Create a slice job instead of calling execute_slicing directly
-            # This ensures consistent job-based workflow for all slicing operations
-            try:
-                existing_slice_jobs = supabase_get("export_jobs", {
-                    "order_id": f"eq.{oid}",
-                    "job_type": "eq.slice_quote",
-                    "status": "in.pending,processing",
-                    "limit": 1
-                }) or []
-
-                if not existing_slice_jobs:
-                    supabase_insert("export_jobs", {
-                        "order_id": oid,
-                        "status": "pending",
-                        "job_type": "slice_quote",
-                        "meta_json": {"source": "fabrication_requested", "requested_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
-                    })
-                    log(f"[fabricate] created slice job for order {oid}")
-            except Exception as exc:
-                log(f"[fabricate] failed to create slice job: {exc}", level='warning', order_id=oid)
-
-            set_status(oid, "slicing")
-            supabase_insert("order_events", {"order_id": oid, "phase": "slicing", "message": "Fabrication requested - queued for print check"})
-            try:
-                supabase_insert("chat_messages", {"order_id": oid, "role": "assistant", "type": "text", "content_json": {"text": "Queueing print check with Bambu X1C profile…"}})
-            except Exception:
-                pass
-            # Job will be claimed by loop_once() via claim_next_export_job()
-            return True
-
-        if status == "exporting":
-            if _skip_if_cancelled(oid, "exporting"):
-                return True
-            # Export a print‑ready STL that reflects the latest transform (size/orientation)
-            rep = latest_asset(oid, "repaired_stl")
-            if not rep:
-                set_status(oid, "needs_review")
-                supabase_insert("order_events", {"order_id": oid, "phase": "export_failed", "message": "No repaired STL found"})
-                return True
-            stl_url = rep.get("url")
-            expected_sha = rep.get('sha256') if isinstance(rep, dict) else None
-            transform = latest_transform(oid) or {}
-            target = transform.get("target_max_dim_mm")
-            import tempfile
-            with tempfile.TemporaryDirectory() as td:
-                try:
-                    base_bytes = download_bytes(stl_url, expected_sha=expected_sha, order_id=oid, context='exporting')
-                except Exception as e:
-                    set_status(oid, "needs_review")
-                    supabase_insert("order_events", {"order_id": oid, "phase": "export_failed", "message": f"download STL: {e}"})
-                    return True
-                base_path = os.path.join(td, 'in.stl')
-                with open(base_path, 'wb') as f:
-                    f.write(base_bytes)
-                out_path = os.path.join(td, 'out.stl')
-                prev = os.environ.get('TARGET_MODEL_MAX_DIM_MM')
-                if target and target > 0:
-                    os.environ['TARGET_MODEL_MAX_DIM_MM'] = str(float(target))
-                ok, logtxt, orient_meta = _blender_orient_and_clamp(base_path, out_path)
-                if prev is None:
-                    os.environ.pop('TARGET_MODEL_MAX_DIM_MM', None)
-                else:
-                    os.environ['TARGET_MODEL_MAX_DIM_MM'] = prev
-                if not ok or not os.path.exists(out_path):
-                    set_status(oid, 'needs_review')
-                    supabase_insert('order_events', { 'order_id': oid, 'phase': 'export_failed', 'message': 'orient/scale failed', 'meta_json': { 'log': (logtxt or '')[:400] } })
-                    return True
-                with open(out_path, 'rb') as f:
-                    sized_bytes = f.read()
-                sha = sha256_bytes(sized_bytes)
-                url = storage_upload_bytes(STORAGE_BUCKET, f"{oid}/{sha}.stl", sized_bytes, content_type='model/stl')
-            orient_summary = _orient_summary(orient_meta)
-            asset_meta: Dict[str, Any] = {}
-            if orient_summary:
-                asset_meta['orientation'] = orient_summary
-            if target and isinstance(target, (int, float)):
-                try:
-                    asset_meta['target_max_dim_mm'] = float(target)
-                except Exception:
-                    pass
-            rep_id = rep.get('id') if isinstance(rep, dict) else None
-            if rep_id:
-                asset_meta['source_asset_id'] = rep_id
-            asset_meta['source_asset_kind'] = 'repaired_stl'
-            sized_rows = attach_asset(oid, 'repaired_sized_stl', url, sha, asset_meta or None) or []
-            sized_asset_id = None
-            try:
-                if sized_rows and isinstance(sized_rows, list):
-                    sized_asset_id = sized_rows[0].get('id')
-            except Exception:
-                sized_asset_id = None
-            # Best‑effort: attach viewer GLB for the sized STL so viewer prefers GLB path
-            try:
-                _attach_viewer_glb(oid, sized_bytes, sized_asset_id, 'repaired_sized_stl', { 'target_max_dim_mm': target if target else None })
-            except Exception as e:
-                log(f"[viewer_glb] attach for sized STL failed: {e}", level='warning', order_id=oid)
-            # Mark STL as ready and notify chat/UI
-            set_status(oid, 'stl_ready')
-            order['status'] = 'stl_ready'
-            supabase_insert('order_events', { 'order_id': oid, 'phase': 'export_done', 'message': 'print‑ready STL available', 'meta_json': { 'asset': 'repaired_sized_stl', 'url': url } })
-            try:
-                parsed = parse_supabase_url(url)
-                signed = url if not parsed else None
-                expires_at = None
-                if parsed:
-                    expires_at = int(time.time() * 1000 + SIGNED_URL_TTL_MS)
-                    maybe_signed = storage_create_signed_url(*parsed)
-                    if maybe_signed:
-                        signed = maybe_signed
-                    else:
-                        expires_at = None
-                if signed:
-                    focus_payload = {
-                        'kind': 'stl',
-                        'url': signed,
-                        'asset_kind': 'repaired_sized_stl',
-                        'storage_url': url,
-                    }
-                    if expires_at is not None:
-                        focus_payload['expires_at'] = expires_at
-                    if sized_asset_id:
-                        focus_payload['asset_id'] = sized_asset_id
-                    supabase_insert('chat_messages', { 'order_id': oid, 'role': 'assistant', 'type': 'viewer.focus', 'content_json': focus_payload })
-            except Exception:
-                pass
-            return True
-
-        if status == "dispatching":
-            if _skip_if_cancelled(oid, "dispatching"):
-                return True
-            three_mf = latest_asset(oid, "three_mf")
-            if not three_mf or not three_mf.get("url"):
-                set_status(oid, "dispatch_failed")
-                supabase_insert("order_events", {"order_id": oid, "phase": "dispatch_failed", "message": "No 3MF available for dispatch"})
-                return True
-            asset_url = three_mf.get("url")
-            parsed = parse_supabase_url(asset_url)
-            expires_at = None
-            signed = asset_url if not parsed else None
-            if parsed:
-                expires_at = int(time.time() * 1000 + SIGNED_URL_TTL_MS)
-                signed_candidate = storage_create_signed_url(*parsed)
-                if signed_candidate:
-                    signed = signed_candidate
-                else:
-                    expires_at = None
-            if not signed:
-                set_status(oid, "dispatch_failed")
-                supabase_insert("order_events", {"order_id": oid, "phase": "dispatch_failed", "message": "Failed to sign 3MF URL"})
-                return True
-            link = build_bambu_connect_link(signed)
-            try:
-                supabase_insert("chat_messages", {"order_id": oid, "role": "assistant", "type": "text", "content_json": {"text": f"Open to print: {link}"}})
-            except Exception:
-                pass
-            supabase_insert("order_events", {"order_id": oid, "phase": "dispatching", "message": "Dispatch link issued", "meta_json": {"link": link}})
-            set_status(oid, "printing")
-            supabase_insert("order_events", {"order_id": oid, "phase": "printing", "message": "Awaiting operator print"})
+        if status not in ("materializing", "await_image_pick", "new"):
+            log(f"[claim] skipping non-provider order status {status}; worker jobs must use export_jobs", order_id=oid)
             return True
 
         # Default pipeline: generate concept mesh and pause for user feedback
@@ -5838,7 +5619,32 @@ def loop_once():
         if _skip_if_cancelled(oid, "post_raw_asset"):
             return True
         _mark_latest_i23d_task(oid, "succeeded")
-        set_status(oid, "visualizing")
+        transition_order_status(oid, "recordProviderTaskSucceeded", "stabilizing", {
+            "raw_asset_kind": raw_kind,
+            "raw_asset_url": raw_url,
+        })
+        try:
+            existing_repair_jobs = supabase_get("export_jobs", {
+                "order_id": f"eq.{oid}",
+                "job_type": "eq.repair",
+                "status": "in.(pending,processing)",
+                "limit": 1,
+            }) or []
+            if not existing_repair_jobs:
+                raw_asset_id = raw_rows[0].get('id') if raw_rows and isinstance(raw_rows, list) else None
+                supabase_insert("export_jobs", {
+                    "order_id": oid,
+                    "status": "pending",
+                    "job_type": "repair",
+                    "meta_json": {
+                        "source": "provider_task_succeeded",
+                        "raw_asset_id": raw_asset_id,
+                        "raw_asset_kind": raw_kind,
+                        "requested_at": now_iso(),
+                    },
+                })
+        except Exception as exc:
+            log(f"[i23d] failed to enqueue repair job: {exc}", level="warning", order_id=oid)
         event_meta = {"asset_kind": raw_kind}
         if stage_label:
             event_meta["materialize_stage"] = stage_label

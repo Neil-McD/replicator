@@ -100,7 +100,7 @@ export async function POST(req: Request) {
     await lifecycle.recordVisualizationSucceeded({
       supabase,
       orderId,
-      actor: auth.user?.id || null,
+      actor: auth.user?.id || 'user',
       idempotencyKey: `order:${orderId}:visualize:edit:${imgRow.id}:${prompt}`,
       metadata: { source: 'edit', parent_image_id: imgRow.id, n },
     })

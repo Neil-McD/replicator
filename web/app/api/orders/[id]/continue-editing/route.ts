@@ -38,7 +38,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     await lifecycle.requestStabilization({
       supabase,
       orderId: params.id,
-      actor: auth.user?.id || null,
+      actor: auth.user?.id || 'user',
       idempotencyKey: `order:${params.id}:stabilize:continue_editing`,
       metadata: { source: 'continue_editing' },
     })

@@ -832,6 +832,7 @@ export async function POST(req: Request) {
           const result = await materializeSelectedImages({
             supabase,
             orderId: activeOrderId,
+            actor: 'chat',
             imageIds: inputIds,
             imageUrls: inputUrls,
             enableQuickMesh,

@@ -43,7 +43,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     await lifecycle.requestDispatch({
       supabase,
       orderId: params.id,
-      actor: auth.user?.id || null,
+      actor: auth.user?.id || 'user',
       idempotencyKey: idempotencyKeys.dispatch(params.id, asset.sha256 || asset.id),
       metadata: { asset_id: asset.id, operator_override: operatorOverride },
     })

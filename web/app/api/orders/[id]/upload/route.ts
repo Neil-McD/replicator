@@ -66,7 +66,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
         await lifecycle.requestVisualization({
           supabase,
           orderId,
-          actor: auth.user?.id || null,
+          actor: auth.user?.id || 'user',
           idempotencyKey: `order:${orderId}:visualize:upload:${path}`,
           metadata: { kind, path },
         })
@@ -74,7 +74,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
         await lifecycle.requestStabilization({
           supabase,
           orderId,
-          actor: auth.user?.id || null,
+          actor: auth.user?.id || 'user',
           idempotencyKey: `order:${orderId}:stabilize:upload:${path}`,
           metadata: { kind, path },
         })

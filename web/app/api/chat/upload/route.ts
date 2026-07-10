@@ -96,7 +96,7 @@ export async function POST(req: Request) {
       await lifecycle.requestVisualization({
         supabase,
         orderId,
-        actor: auth.user?.id || null,
+        actor: auth.user?.id || 'user',
         idempotencyKey: `order:${orderId}:visualize:chat_upload:${attachments.map((a) => a.asset_id).join(',')}`,
         metadata: { source: 'chat_upload', count: attachments.length },
       })

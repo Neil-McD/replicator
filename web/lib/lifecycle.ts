@@ -40,6 +40,7 @@ export type LifecycleCommand =
   | 'recordProviderTaskSucceeded'
   | 'recordProviderTaskFailed'
   | 'requestStabilization'
+  | 'requestExportStl'
   | 'recordRepairSucceeded'
   | 'recordRepairFailed'
   | 'requestSliceQuote'
@@ -82,6 +83,7 @@ const TRANSITIONS: Record<LifecycleCommand, TransitionRule | null> = {
   recordProviderTaskSucceeded: { from: ['materializing'], to: 'stabilizing' },
   recordProviderTaskFailed: { from: ['visualizing', 'materializing'], to: 'generate_failed' },
   requestStabilization: { from: ['new', 'await_image_pick', 'materializing', 'stabilizing', 'ready_to_pay', 'repair_failed', 'needs_review'], to: 'stabilizing' },
+  requestExportStl: null,
   recordRepairSucceeded: { from: ['stabilizing'], to: 'slicing' },
   recordRepairFailed: { from: ['stabilizing'], to: 'repair_failed' },
   requestSliceQuote: { from: ['stabilizing', 'ready_to_pay', 'slice_failed', 'needs_review'], to: 'slicing' },
@@ -102,8 +104,8 @@ export type TransitionInput = {
   supabase: SupabaseClient<any, any, any>
   orderId: string
   command: LifecycleCommand
-  actor?: string | null
-  idempotencyKey?: string | null
+  actor: string
+  idempotencyKey: string
   metadata?: Record<string, any> | null
   result?: Record<string, any> | null
   allowNoop?: boolean
@@ -168,13 +170,21 @@ async function findCompletedCommand(supabase: SupabaseClient<any, any, any>, key
   return null
 }
 
+function assertCommandBoundary(input: TransitionInput) {
+  if (!input.actor || !String(input.actor).trim()) {
+    throw new Error(`missing_actor:${input.command}`)
+  }
+  if (!input.idempotencyKey || !String(input.idempotencyKey).trim()) {
+    throw new Error(`missing_idempotency_key:${input.command}`)
+  }
+}
+
 async function recordCommand(
   supabase: SupabaseClient<any, any, any>,
   input: TransitionInput,
   status: 'started' | 'succeeded' | 'failed',
   result?: Record<string, any> | null,
 ) {
-  if (!input.idempotencyKey) return
   try {
     await supabase.from('order_commands').upsert({
       key: input.idempotencyKey,
@@ -191,7 +201,52 @@ async function recordCommand(
   }
 }
 
+async function enqueueExportJobForCommand(input: TransitionInput) {
+  const jobType =
+    input.command === 'requestStabilization' ? 'repair'
+    : input.command === 'requestSliceQuote' ? 'slice_quote'
+    : input.command === 'requestDispatch' ? 'dispatch'
+    : null
+  if (!jobType) return null
+
+  try {
+    const { data: existing } = await input.supabase
+      .from('export_jobs')
+      .select('id,status,job_type')
+      .eq('order_id', input.orderId)
+      .eq('job_type', jobType)
+      .in('status', ['pending', 'processing'])
+      .order('created_at', { ascending: false })
+      .limit(1)
+    if (existing && existing.length > 0) return existing[0]
+
+    const { data, error } = await input.supabase
+      .from('export_jobs')
+      .insert({
+        order_id: input.orderId,
+        status: 'pending',
+        job_type: jobType,
+        requested_by: input.actor || null,
+        meta_json: {
+          source: input.command,
+          idempotency_key: input.idempotencyKey,
+          ...(input.metadata || {}),
+          requested_at: new Date().toISOString(),
+        },
+      })
+      .select('id,status,job_type')
+      .single()
+    if (error) throw error
+    return data
+  } catch {
+    // The command owns the lifecycle transition. Job insertion is best-effort in
+    // tests and pre-migration deployments, and API routes may already enqueue.
+    return null
+  }
+}
+
 export async function runLifecycleCommand(input: TransitionInput): Promise<{ status: OrderStatus | null; reused: boolean; result?: any }> {
+  assertCommandBoundary(input)
   const completed = await findCompletedCommand(input.supabase, input.idempotencyKey)
   if (completed) return { status: null, reused: true, result: completed.result_json }
 
@@ -224,17 +279,26 @@ export async function runLifecycleCommand(input: TransitionInput): Promise<{ sta
     throw new Error(message)
   }
 
-  const { error: updateError } = await input.supabase
+  const { data: updatedOrder, error: updateError } = await input.supabase
     .from('orders')
     .update({ status: target })
     .eq('id', input.orderId)
+    .eq('status', order.status)
     .neq('status', 'cancelled')
+    .select('id,status')
+    .maybeSingle()
   if (updateError) {
     await recordCommand(input.supabase, input, 'failed', { error: updateError.message })
     throw updateError
   }
+  if (!updatedOrder) {
+    const message = `stale_transition:${current}:${input.command}:${target}`
+    await recordCommand(input.supabase, input, 'failed', { error: message })
+    throw new Error(message)
+  }
 
-  const result = { ...(input.result || {}), status: target }
+  const job = await enqueueExportJobForCommand(input)
+  const result = { ...(input.result || {}), status: target, ...(job ? { job_id: job.id, job_type: job.job_type } : {}) }
   await recordCommand(input.supabase, input, 'succeeded', result)
   return { status: target, reused: false, result }
 }
@@ -243,9 +307,11 @@ export const lifecycle = {
   requestVisualization: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'requestVisualization' }),
   recordVisualizationSucceeded: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'recordVisualizationSucceeded' }),
   selectImageForMaterialization: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'selectImageForMaterialization' }),
+  recordProviderTaskQueued: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'recordProviderTaskQueued' }),
   recordProviderTaskSucceeded: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'recordProviderTaskSucceeded' }),
   recordProviderTaskFailed: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'recordProviderTaskFailed' }),
   requestStabilization: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'requestStabilization' }),
+  requestExportStl: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'requestExportStl' }),
   requestSliceQuote: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'requestSliceQuote' }),
   recordSliceQuoteSucceeded: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'recordSliceQuoteSucceeded' }),
   recordSliceQuoteFailed: (input: Omit<TransitionInput, 'command'>) => runLifecycleCommand({ ...input, command: 'recordSliceQuoteFailed' }),

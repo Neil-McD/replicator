@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { createAdminClient } from '@/lib/supabaseAdmin'
 import { requireAuthContext } from '@/lib/apiAuth'
+import { hashForIdempotency, lifecycle } from '@/lib/lifecycle'
 
 const DEFAULT_TARGET_TOLERANCE_MM = 0.1
 
@@ -63,7 +64,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     try {
       const { data: repaired } = await supabase
         .from('assets')
-        .select('id,kind,created_at')
+        .select('id,kind,sha256,created_at')
         .eq('order_id', orderId)
         .eq('kind', 'repaired_stl')
         .order('created_at', { ascending: false })
@@ -137,6 +138,14 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       transform_asset_id: transformAssetId,
       meta_json: { source: 'stage', requested_at: new Date().toISOString() },
     }
+
+    await lifecycle.requestExportStl({
+      supabase,
+      orderId,
+      actor: auth.user?.id || 'user',
+      idempotencyKey: `order:${orderId}:export_stl:${hashForIdempotency({ target, tolerance, transformAssetId })}`,
+      metadata: { target_max_dim_mm: target, tolerance_mm: tolerance, transform_asset_id: transformAssetId },
+    })
 
     // Supersede older pending/processing export jobs for this order.
     try {

@@ -86,7 +86,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     await lifecycle.requestSliceQuote({
       supabase,
       orderId,
-      actor: auth.user?.id || null,
+      actor: auth.user?.id || 'user',
       idempotencyKey: idempotencyKeys.sliceQuote(orderId, repaired[0]?.sha256 || repaired[0]?.id || null, process.env.BAMBUSTUDIO_PROFILE_PATH || 'default', 'env'),
       metadata: { job_id: jobRow.id, source: 'manual_retry' },
     })
