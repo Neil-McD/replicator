@@ -2,6 +2,7 @@ import { headers } from 'next/headers'
 import { NextResponse } from 'next/server'
 import Stripe from 'stripe'
 import { createAdminClient } from '@/lib/supabaseAdmin'
+import { idempotencyKeys, lifecycle } from '@/lib/lifecycle'
 
 export const runtime = 'nodejs'
 
@@ -19,19 +20,30 @@ export async function POST(req: Request) {
       const order_id = session.metadata?.order_id
       if (order_id) {
         const supabase = createAdminClient()
-        await supabase
+        const { data: existingPayment } = await supabase
           .from('payments')
-          .insert({ order_id, provider_ref: session.id, amount_cents: session.amount_total || 0, status: 'succeeded' })
+          .select('id')
+          .eq('provider_ref', session.id)
+          .maybeSingle()
+        if (!existingPayment) {
+          await supabase
+            .from('payments')
+            .insert({ order_id, provider_ref: session.id, amount_cents: session.amount_total || 0, status: 'succeeded' })
+        }
         await supabase
           .from('orders')
-          .update({ status: 'dispatching', payment_status: 'paid' })
+          .update({ payment_status: 'paid' })
           .eq('id', order_id)
+        await lifecycle.authorizePayment({
+          supabase,
+          orderId: order_id,
+          actor: 'stripe',
+          idempotencyKey: idempotencyKeys.stripeCheckoutSession(session.id),
+          metadata: { amount_cents: session.amount_total || 0 },
+        })
         await supabase
           .from('order_events')
-          .insert([
-            { order_id, phase: 'paid', message: 'Stripe checkout completed' },
-            { order_id, phase: 'dispatching', message: 'Preparing dispatch to printer' },
-          ])
+          .insert({ order_id, phase: 'paid', message: 'Stripe checkout completed' })
       }
     }
     return new NextResponse(null, { status: 200 })

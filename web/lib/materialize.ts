@@ -5,6 +5,7 @@ import { attachQuickMesh } from '@/lib/providers/i23d'
 import { getEditProvider } from '@/lib/providers/edit'
 import { mirrorRemoteImageToStorage } from '@/lib/storage'
 import { robustImageFetch } from '@/lib/httpFetch'
+import { idempotencyKeys, lifecycle } from '@/lib/lifecycle'
 
 type UploadResult = { id: string; assetUrl: string; viewRole?: string | null }
 
@@ -252,7 +253,12 @@ export async function materializeSelectedImages(options: MaterializeOptions): Pr
         },
       })
     }
-    await supabase.from('orders').update({ status: 'materializing' }).eq('id', orderId)
+    await lifecycle.selectImageForMaterialization({
+      supabase,
+      orderId,
+      idempotencyKey: `${idempotencyKeys.materialization(orderId, fallbackViews.map((v) => v.imageId), process.env.I23D_PROVIDER || 'worker')}:select`,
+      metadata: { image_count: fallbackViews.length, fallback: true },
+    })
     await supabase
       .from('order_events')
       .insert({ order_id: orderId, phase: 'materializing', message: `Selected ${fallbackViews.length} image(s) (remote fallback)` })
@@ -304,7 +310,12 @@ export async function materializeSelectedImages(options: MaterializeOptions): Pr
     })
   }
 
-  await supabase.from('orders').update({ status: 'materializing' }).eq('id', orderId)
+  await lifecycle.selectImageForMaterialization({
+    supabase,
+    orderId,
+    idempotencyKey: `${idempotencyKeys.materialization(orderId, uploaded.map((u) => u.id), process.env.I23D_PROVIDER || 'worker')}:select`,
+    metadata: { image_count: uploaded.length, fallback: false },
+  })
   await supabase
     .from('order_events')
     .insert({ order_id: orderId, phase: 'materializing', message: `Selected ${uploaded.length} image(s)` })

@@ -1458,8 +1458,9 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
             t = tasks[0]
             oid = t.get("order_id")
             if oid:
-                # Mark order as generating and task as running
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"status": "generating", "worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+                # Provider task state owns queue execution; orders.status exposes the customer lifecycle.
+                transition_order_status(oid, "selectImageForMaterialization", "materializing")
+                supabase_patch("orders", {"id": f"eq.{oid}"}, {"worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
                 try:
                     supabase_patch(
                         "generation_tasks",
@@ -1489,9 +1490,9 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
-    # 2a) Fabrication requested (repair + slice pipeline)
+    # 2a) Canonical stabilization requested (repair + slice pipeline)
     try:
-        fab = supabase_get("orders", {"status": "eq.fabrication_requested", "order": "created_at.asc", "limit": 1}) or []
+        fab = supabase_get("orders", {"status": "eq.stabilizing", "order": "created_at.asc", "limit": 1}) or []
         if fab:
             o = fab[0]
             oid = o.get("id")
@@ -1502,7 +1503,7 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
-    # 2b) Orders requesting print‑ready STL export (status='exporting')
+    # 2b) Legacy compatibility only: pre-lifecycle rows may still be marked exporting.
     try:
         exporting = supabase_get("orders", {"status": "eq.exporting", "order": "created_at.asc", "limit": 1}) or []
         if exporting:
@@ -1528,7 +1529,8 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
             has_image = any((u.get("kind") == "upload_image") for u in ups)
             has_model = any((u.get("kind") in ("upload_stl","upload_obj","upload_glb")) for u in ups)
             if has_image or has_model:
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"status": "generating", "worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+                transition_order_status(oid, "selectImageForMaterialization", "materializing")
+                supabase_patch("orders", {"id": f"eq.{oid}"}, {"worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
                 _claim_backoff_reset()
                 return o
     except Exception:
@@ -1559,16 +1561,96 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
     # No suitable orders
     return None
 
-def set_status(order_id: str, status: str):
-    target_status = str(status)
+CANONICAL_ORDER_STATUSES = {
+    "new",
+    "visualizing",
+    "await_image_pick",
+    "materializing",
+    "stabilizing",
+    "slicing",
+    "ready_to_pay",
+    "paid",
+    "dispatching",
+    "printing",
+    "done",
+    "needs_review",
+    "generate_failed",
+    "repair_failed",
+    "slice_failed",
+    "dispatch_failed",
+    "cancelled",
+}
+
+DEPRECATED_ORDER_STATUS_MAP = {
+    "generating": "materializing",
+    "fabrication_requested": "stabilizing",
+    "repairing": "stabilizing",
+    "exporting": "stabilizing",
+    "stl_ready": "ready_to_pay",
+}
+
+WORKER_TRANSITION_COMMANDS = {
+    "visualizing": "requestVisualization",
+    "await_image_pick": "recordVisualizationSucceeded",
+    "materializing": "selectImageForMaterialization",
+    "stabilizing": "requestStabilization",
+    "slicing": "requestSliceQuote",
+    "ready_to_pay": "recordSliceQuoteSucceeded",
+    "paid": "authorizePayment",
+    "dispatching": "requestDispatch",
+    "printing": "recordPrintingStarted",
+    "done": "recordPrintDone",
+    "needs_review": "workerNeedsReview",
+    "generate_failed": "recordProviderTaskFailed",
+    "repair_failed": "recordRepairFailed",
+    "slice_failed": "recordSliceQuoteFailed",
+    "dispatch_failed": "recordDispatchFailed",
+    "cancelled": "cancelOrder",
+}
+
+
+def normalize_order_status(status: Any) -> str:
+    raw = str(status or "new").strip()
+    if raw in CANONICAL_ORDER_STATUSES:
+        return raw
+    return DEPRECATED_ORDER_STATUS_MAP.get(raw, "needs_review")
+
+
+def transition_order_status(order_id: str, command: str, target_status: str, metadata: Optional[Dict[str, Any]] = None):
+    target_status = normalize_order_status(target_status)
+    if target_status not in CANONICAL_ORDER_STATUSES:
+        target_status = "needs_review"
     params: Dict[str, Any] = {"id": f"eq.{order_id}"}
     # Do not overwrite a client-requested cancellation with later worker updates.
     if target_status.lower() != "cancelled":
         params["status"] = "neq.cancelled"
     try:
         supabase_patch("orders", params, {"status": target_status})
+        try:
+            supabase_insert("order_events", {
+                "order_id": order_id,
+                "phase": target_status,
+                "message": f"Lifecycle transition via {command}",
+                "meta_json": metadata or {},
+            })
+        except Exception:
+            pass
     except Exception as exc:
         log(f"[status] failed to set {target_status} for order {order_id}: {exc}")
+
+
+def set_status(order_id: str, status: str):
+    target_status = normalize_order_status(status)
+    if str(status) == "stl_ready":
+        try:
+            rows = supabase_get("orders", {"id": f"eq.{order_id}", "select": "quote_json", "limit": 1}) or []
+            quote = rows[0].get("quote_json") if rows else None
+            if not isinstance(quote, dict) or not quote.get("minutes") or not quote.get("grams"):
+                target_status = "stabilizing"
+        except Exception:
+            target_status = "stabilizing"
+    command = WORKER_TRANSITION_COMMANDS.get(target_status, "workerTransition")
+    transition_order_status(order_id, command, target_status, {"legacy_status": str(status)})
 
 
 def reload_order(order_id: str) -> Optional[Dict[str, Any]]:
@@ -1938,8 +2020,8 @@ def claim_next_export_job() -> Optional[Dict[str, Any]]:
         # Diagnostic: count pending jobs by type
         all_pending = supabase_get("export_jobs", {"status": "eq.pending", "select": "id,job_type,order_id,created_at"}) or []
         if all_pending:
-            export_count = sum(1 for j in all_pending if j.get('job_type') == 'export')
-            slice_count = sum(1 for j in all_pending if j.get('job_type') == 'slice')
+            export_count = sum(1 for j in all_pending if j.get('job_type') in ('export_stl', 'export'))
+            slice_count = sum(1 for j in all_pending if j.get('job_type') in ('slice_quote', 'slice'))
             log(f"[claim] Found {len(all_pending)} pending jobs: {export_count} export, {slice_count} slice")
 
         # Claim both 'export' and 'slice' jobs, prioritize by created_at
@@ -1952,7 +2034,7 @@ def claim_next_export_job() -> Optional[Dict[str, Any]]:
     job = rows[0]
     job_id = job.get('id')
     order_id = job.get('order_id')
-    job_type = job.get('job_type', 'export')
+    job_type = job.get('job_type', 'export_stl')
     if not job_id or not order_id:
         return None
     claimed_at = now_iso()
@@ -2060,11 +2142,11 @@ def fail_export_job(job: Dict[str, Any], message: str, *, meta: Optional[Dict[st
 
 def process_export_job(job: Dict[str, Any]) -> bool:
     """Dispatch to export or slice handler based on job_type."""
-    job_type = job.get('job_type', 'export')
+    job_type = job.get('job_type', 'export_stl')
 
-    if job_type == 'slice':
+    if job_type in ('slice_quote', 'slice'):
         return _process_slice_job(job)
-    elif job_type == 'export':
+    elif job_type in ('export_stl', 'export'):
         return _process_sized_export_job(job)
     else:
         log(
@@ -5333,8 +5415,8 @@ def loop_once():
             execute_slicing_with_retries(order)
             return True
 
-        if status == "fabrication_requested":
-            if _skip_if_cancelled(oid, "fabrication_requested"):
+        if status in ("stabilizing", "fabrication_requested"):
+            if _skip_if_cancelled(oid, "stabilizing"):
                 return True
             src_ids = _get_selected_image_ids(oid)
             rep_asset = latest_asset(oid, "repaired_stl")
@@ -5526,7 +5608,7 @@ def loop_once():
             try:
                 existing_slice_jobs = supabase_get("export_jobs", {
                     "order_id": f"eq.{oid}",
-                    "job_type": "eq.slice",
+                    "job_type": "eq.slice_quote",
                     "status": "in.pending,processing",
                     "limit": 1
                 }) or []
@@ -5535,7 +5617,7 @@ def loop_once():
                     supabase_insert("export_jobs", {
                         "order_id": oid,
                         "status": "pending",
-                        "job_type": "slice",
+                        "job_type": "slice_quote",
                         "meta_json": {"source": "fabrication_requested", "requested_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
                     })
                     log(f"[fabricate] created slice job for order {oid}")

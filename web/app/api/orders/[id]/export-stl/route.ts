@@ -124,13 +124,13 @@ export async function POST(req: Request, { params }: { params: { id: string } })
 
     const succeededJob = jobs.find((job: any) => String(job.status || '').toLowerCase() === 'succeeded' && job.asset_id && approxMatch(normalizeTarget(job.target_max_dim_mm), target, tolerance))
     if (succeededJob) {
-      await supabase.from('orders').update({ status: 'stl_ready' }).eq('id', orderId)
       return NextResponse.json({ ok: true, jobId: succeededJob.id, status: succeededJob.status, reused: true, assetId: succeededJob.asset_id })
     }
 
     const insertPayload: any = {
       order_id: orderId,
       status: 'pending',
+      job_type: 'export_stl',
       target_max_dim_mm: target,
       target_tolerance_mm: tolerance,
       requested_by: auth.user?.id ?? null,
@@ -156,7 +156,6 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       throw jobErr || new Error('failed_to_enqueue_export_job')
     }
 
-    await supabase.from('orders').update({ status: 'exporting' }).eq('id', orderId)
     await supabase.from('order_events').insert({
       order_id: orderId,
       phase: 'export_stl',

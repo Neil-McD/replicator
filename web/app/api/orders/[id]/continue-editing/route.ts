@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { createAdminClient } from '@/lib/supabaseAdmin'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { lifecycle } from '@/lib/lifecycle'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -34,18 +35,13 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       )
     }
 
-    // Set status back to stl_ready, preserving the quote for reference
-    const { error: updateError } = await supabase
-      .from('orders')
-      .update({ status: 'stl_ready' })
-      .eq('id', params.id)
-
-    if (updateError) {
-      return NextResponse.json(
-        { error: 'update_failed', message: 'Failed to update order status' },
-        { status: 500 }
-      )
-    }
+    await lifecycle.requestStabilization({
+      supabase,
+      orderId: params.id,
+      actor: auth.user?.id || null,
+      idempotencyKey: `order:${params.id}:stabilize:continue_editing`,
+      metadata: { source: 'continue_editing' },
+    })
 
     // Log the event
     try {
@@ -56,7 +52,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       })
     } catch {}
 
-    return NextResponse.json({ ok: true, status: 'stl_ready' })
+    return NextResponse.json({ ok: true, status: 'stabilizing' })
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 })
   }

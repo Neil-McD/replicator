@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { createAdminClient } from '@/lib/supabaseAdmin'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { idempotencyKeys, lifecycle } from '@/lib/lifecycle'
 
 export const runtime = 'nodejs'
 
@@ -28,7 +29,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     // Guard: require a repaired STL to exist
     const { data: repaired } = await supabase
       .from('assets')
-      .select('id')
+      .select('id,sha256')
       .eq('order_id', orderId)
       .eq('kind', 'repaired_stl')
       .order('created_at', { ascending: false })
@@ -50,7 +51,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       .from('export_jobs')
       .select('id,status')
       .eq('order_id', orderId)
-      .eq('job_type', 'slice')
+      .eq('job_type', 'slice_quote')
       .in('status', ['pending', 'processing'])
       .order('created_at', { ascending: false })
       .limit(1)
@@ -71,7 +72,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       .insert({
         order_id: orderId,
         status: 'pending',
-        job_type: 'slice',
+        job_type: 'slice_quote',
         requested_by: auth.user?.id ?? null,
         meta_json: { source: 'manual_retry', requested_at: new Date().toISOString() }
       })
@@ -82,8 +83,13 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       throw jobErr || new Error('failed_to_enqueue_slice_job')
     }
 
-    // Update order status to slicing (for backward compat with existing UI)
-    await supabase.from('orders').update({ status: 'slicing' }).eq('id', orderId)
+    await lifecycle.requestSliceQuote({
+      supabase,
+      orderId,
+      actor: auth.user?.id || null,
+      idempotencyKey: idempotencyKeys.sliceQuote(orderId, repaired[0]?.sha256 || repaired[0]?.id || null, process.env.BAMBUSTUDIO_PROFILE_PATH || 'default', 'env'),
+      metadata: { job_id: jobRow.id, source: 'manual_retry' },
+    })
 
     await supabase
       .from('order_events')
@@ -99,4 +105,3 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 })
   }
 }
-

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { handleStoreRequest } from '@/app/api/orders/[id]/store/route'
+import { handleStoreRequest } from '@/lib/storePublish'
 
 class StubSupabase {
   tables: Record<string, any>
@@ -70,7 +70,7 @@ class StubSupabase {
   }
 }
 
-test('handleStoreRequest queues export when only repaired STL exists', async () => {
+test('handleStoreRequest rejects ready publish when only repaired STL exists', async () => {
   const orderId = 'order-123'
   const supabase = new StubSupabase({
     orders: {
@@ -96,19 +96,14 @@ test('handleStoreRequest queues export when only repaired STL exists', async () 
   })
 
   const auth = { isAdmin: false, user: { id: 'user-1' } }
-  const body = {}
+  const body = { status: 'ready', visibility: 'public' }
 
   const response = await handleStoreRequest({ supabase, auth, orderId, body })
-  assert.equal(response.status, 202)
+  assert.equal(response.status, 409)
   const payload = await response.json()
-  assert.equal(payload.status, 'pending_export')
-
-  assert.equal(supabase.updates.length, 1)
-  assert.equal(supabase.updates[0].table, 'orders')
-  assert.equal(supabase.updates[0].payload.status, 'exporting')
-
-  const insertedTables = supabase.inserts.map((entry) => entry.table)
-  assert.deepEqual(insertedTables.sort(), ['chat_messages', 'order_events'])
+  assert.equal(payload.error, 'three_mf_missing')
+  assert.equal(supabase.updates.length, 0)
+  assert.equal(supabase.inserts.length, 0)
 })
 
 test('handleStoreRequest rejects when no repaired STL is available', async () => {

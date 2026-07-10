@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { createAdminClient } from '@/lib/supabaseAdmin'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { lifecycle } from '@/lib/lifecycle'
 
 export const runtime = 'nodejs'
 
@@ -59,9 +60,25 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       },
     })
     console.log('[api/orders/:id/upload POST] saved asset kind=', kind, 'path=', path)
-    // Nudge the worker: ensure the order is in a claimable state
+    // Nudge the pipeline without resetting customer-visible lifecycle state.
     try {
-      await supabase.from('orders').update({ status: 'new' }).eq('id', orderId)
+      if (kind === 'upload_image') {
+        await lifecycle.requestVisualization({
+          supabase,
+          orderId,
+          actor: auth.user?.id || null,
+          idempotencyKey: `order:${orderId}:visualize:upload:${path}`,
+          metadata: { kind, path },
+        })
+      } else if (['upload_stl', 'upload_obj', 'upload_glb'].includes(kind)) {
+        await lifecycle.requestStabilization({
+          supabase,
+          orderId,
+          actor: auth.user?.id || null,
+          idempotencyKey: `order:${orderId}:stabilize:upload:${path}`,
+          metadata: { kind, path },
+        })
+      }
       await supabase.from('order_events').insert({ order_id: orderId, phase: 'upload', message: `uploaded ${kind}` })
     } catch {}
     return NextResponse.json({ ok: true })

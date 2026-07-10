@@ -7,6 +7,9 @@ const testDir = path.dirname(fileURLToPath(import.meta.url))
 const webRoot = path.resolve(testDir, '..')
 
 export async function resolve(specifier, context, defaultResolve) {
+  if (specifier.startsWith('node:')) {
+    return defaultResolve(specifier, context, defaultResolve)
+  }
   if (specifier.startsWith('@/')) {
     const target = path.join(webRoot, specifier.slice(2))
     const withExt = await resolveWithExtensions(target)
@@ -14,7 +17,8 @@ export async function resolve(specifier, context, defaultResolve) {
   }
   if (specifier.startsWith('./') || specifier.startsWith('../')) {
     const parentURL = context.parentURL ? fileURLToPath(context.parentURL) : webRoot
-    const resolved = path.resolve(path.dirname(parentURL), specifier)
+    const baseDir = specifier.startsWith('./test/') ? webRoot : path.dirname(parentURL)
+    const resolved = path.resolve(baseDir, specifier)
     const withExt = await resolveWithExtensions(resolved)
     return { url: pathToFileURL(withExt).href, shortCircuit: true }
   }
