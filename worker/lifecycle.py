@@ -103,3 +103,37 @@ def transition_quote_ready(
         event_meta=quote,
         patch={"quote_json": quote},
     )
+
+
+def request_order_job(
+    rpc: Callable[[str, Dict[str, Any]], Any],
+    order_id: str,
+    job_type: str,
+    *,
+    actor: str = "worker",
+    source: str = "worker",
+    event_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    if job_type not in ("export", "slice"):
+        raise LifecycleTransitionError("invalid_job_type")
+    result = rpc(
+        "request_order_job",
+        {
+            "p_order_id": order_id,
+            "p_job_type": job_type,
+            "p_actor": actor,
+            "p_requested_by": None,
+            "p_target_max_dim_mm": None,
+            "p_target_tolerance_mm": 0.1,
+            "p_transform_asset_id": None,
+            "p_source": source,
+            "p_event_message": event_message,
+        },
+    )
+    if not isinstance(result, dict) or not result.get("ok") or not result.get("job_id"):
+        payload = result if isinstance(result, dict) else {}
+        raise LifecycleTransitionError(
+            str(payload.get("error") or "lifecycle_transition_failed"),
+            payload.get("previous_status"),
+        )
+    return result

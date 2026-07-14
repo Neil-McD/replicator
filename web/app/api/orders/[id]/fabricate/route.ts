@@ -2,7 +2,8 @@ import { NextResponse } from 'next/server'
 import { createAdminClient } from '@/lib/supabaseAdmin'
 import { requireAuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
-import { LifecycleTransitionError, lifecycleHttpStatus, requestFabrication } from '@/lib/lifecycle'
+import { LifecycleTransitionError, lifecycleHttpStatus } from '@/lib/lifecycle'
+import { handleFabricationLifecycleRequest } from '@/lib/lifecycleRouteHandlers'
 
 export async function POST(req: Request, { params }: { params: { id: string } }) {
   try {
@@ -22,18 +23,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       const { status, body } = handleOrderAccessError(error)
       return NextResponse.json(body, { status })
     }
-    const result = await requestFabrication(supabase, orderId, {
-      actor: auth.isAdmin || auth.isOperator ? 'operator' : 'user',
-      idempotencyKey: `fabricate:${orderId}`,
-      eventMessage: 'User requested fabrication',
-      patch: { worker_id: null, locked_at: null, meta_json: { cancel_requested: false } },
-    })
-    if (result.changed) {
-      try {
-        await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: 'On it — stabilizing the mesh for a print-ready quote.' } })
-      } catch { /* no-op */ }
-    }
-    return NextResponse.json({ ok: true, status: result.newStatus, reused: result.reused })
+    return await handleFabricationLifecycleRequest(supabase, orderId, auth)
   } catch (e: any) {
     if (e instanceof LifecycleTransitionError) {
       return NextResponse.json({ error: e.code }, { status: lifecycleHttpStatus(e) })

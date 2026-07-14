@@ -1,21 +1,8 @@
 import { NextResponse } from 'next/server'
 import { createAdminClient } from '@/lib/supabaseAdmin'
 import { requireAuthContext } from '@/lib/apiAuth'
-import { LifecycleTransitionError, lifecycleHttpStatus, markStlReady, requestExport } from '@/lib/lifecycle'
-
-const DEFAULT_TARGET_TOLERANCE_MM = 0.1
-
-function normalizeTarget(value: any): number | null {
-  const num = Number(value)
-  if (!Number.isFinite(num) || num <= 0) return null
-  return num
-}
-
-function approxMatch(a: number | null, b: number | null, tolerance: number): boolean {
-  if (a == null && b == null) return true
-  if (a == null || b == null) return false
-  return Math.abs(a - b) <= tolerance
-}
+import { LifecycleTransitionError, lifecycleHttpStatus } from '@/lib/lifecycle'
+import { handleExportLifecycleRequest } from '@/lib/lifecycleRouteHandlers'
 
 export const runtime = 'nodejs'
 
@@ -46,139 +33,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       return NextResponse.json({ error: 'forbidden' }, { status: 403 })
     }
     const body = await req.json().catch(() => ({})) as any
-    const rawTarget = normalizeTarget(body?.target_max_dim_mm)
-    const rawTolerance = normalizeTarget(body?.target_tolerance_mm)
-    const maxTarget = Math.max(20, Number(process.env.MAX_TARGET_DIM_MM || 230))
-    const target = rawTarget != null ? Math.min(rawTarget, maxTarget) : null
-    const tolerance = Math.max(0.1, rawTolerance ?? DEFAULT_TARGET_TOLERANCE_MM)
-
-    // Guard: require a repaired STL to exist before queuing an export.
-    // This mirrors the worker's expectation (it reads latest 'repaired_stl').
-    try {
-      const { data: repaired } = await supabase
-        .from('assets')
-        .select('id,kind,created_at')
-        .eq('order_id', orderId)
-        .eq('kind', 'repaired_stl')
-        .order('created_at', { ascending: false })
-        .limit(1)
-      if (!repaired || repaired.length === 0) {
-        // Collect minimal debug hints to help the client/UI
-        const { data: assetsBrief } = await supabase
-          .from('assets')
-          .select('id,kind,created_at')
-          .eq('order_id', orderId)
-          .order('created_at', { ascending: false })
-          .limit(50)
-        const kinds = (assetsBrief || []).map((a: any) => a.kind)
-        const present = {
-          raw: kinds.filter((k) => String(k||'').startsWith('raw_')).length,
-          upload_models: kinds.filter((k) => ['upload_stl','upload_obj','upload_glb'].includes(String(k))).length,
-          images: kinds.filter((k) => k === 'upload_image').length,
-          repaired: 0,
-        }
-        return NextResponse.json({
-          error: 'no_repaired_stl',
-          message: 'No repaired STL available. Generate or upload a model first, or wait for the worker to finish repair.',
-          debug: { present }
-        }, { status: 409 })
-      }
-    } catch {}
-
-    // Record/refresh transform so the worker applies most recent intent
-    let transformAssetId: string | null = null
-    if (target != null) {
-      const { data: transformRow, error: transformErr } = await supabase
-        .from('assets')
-        .insert({ order_id: orderId, kind: 'transform', url: '', meta_json: { target_max_dim_mm: target } })
-        .select('id')
-        .single()
-      if (!transformErr && transformRow?.id) {
-        transformAssetId = transformRow.id
-      }
-    }
-
-    // Reuse an in-flight job if the same target is already pending/processing
-    const { data: existingJobs, error: jobsErr } = await supabase
-      .from('export_jobs')
-      .select('id,status,target_max_dim_mm,asset_id,completed_at')
-      .eq('order_id', orderId)
-      .eq('job_type', 'export')
-      .order('created_at', { ascending: false })
-      .limit(10)
-
-    if (jobsErr) {
-      console.warn('[export-stl] failed to load existing jobs', jobsErr)
-    }
-
-    const jobs = Array.isArray(existingJobs) ? existingJobs : []
-    const pendingJob = jobs.find((job: any) => ['pending', 'processing'].includes(String(job.status || '').toLowerCase()) && approxMatch(normalizeTarget(job.target_max_dim_mm), target, tolerance))
-    if (pendingJob) {
-      await requestExport(supabase, orderId, {
-        actor: auth.isAdmin || auth.isOperator ? 'operator' : 'user',
-        idempotencyKey: `export:${pendingJob.id}`,
-        eventMessage: 'Print-ready STL export already queued',
-        patch: { meta_json: { cancel_requested: false } },
-      })
-      return NextResponse.json({ ok: true, jobId: pendingJob.id, status: pendingJob.status, reused: true })
-    }
-
-    const succeededJob = jobs.find((job: any) => String(job.status || '').toLowerCase() === 'succeeded' && job.asset_id && approxMatch(normalizeTarget(job.target_max_dim_mm), target, tolerance))
-    if (succeededJob) {
-      await requestExport(supabase, orderId, {
-        actor: auth.isAdmin || auth.isOperator ? 'operator' : 'user',
-        idempotencyKey: `export-reuse:${succeededJob.id}`,
-        eventMessage: 'Reusing completed print-ready STL export',
-        patch: { meta_json: { cancel_requested: false } },
-      })
-      await markStlReady(supabase, orderId, {
-        actor: 'system',
-        idempotencyKey: `export-ready:${succeededJob.id}`,
-        eventMessage: 'Print-ready STL available',
-        eventMeta: { job_id: succeededJob.id, asset_id: succeededJob.asset_id },
-      })
-      return NextResponse.json({ ok: true, jobId: succeededJob.id, status: succeededJob.status, reused: true, assetId: succeededJob.asset_id })
-    }
-
-    const insertPayload: any = {
-      order_id: orderId,
-      status: 'pending',
-      job_type: 'export',
-      target_max_dim_mm: target,
-      target_tolerance_mm: tolerance,
-      requested_by: auth.user?.id ?? null,
-      transform_asset_id: transformAssetId,
-      meta_json: { source: 'stage', requested_at: new Date().toISOString() },
-    }
-
-    // Supersede older pending/processing export jobs for this order.
-    try {
-      await supabase
-        .from('export_jobs')
-        .update({ status: 'cancelled' })
-        .eq('order_id', orderId)
-        .eq('job_type', 'export')
-        .in('status', ['pending','processing'])
-    } catch {}
-
-    const { data: jobRow, error: jobErr } = await supabase
-      .from('export_jobs')
-      .insert(insertPayload)
-      .select('*')
-      .single()
-    if (jobErr || !jobRow) {
-      throw jobErr || new Error('failed_to_enqueue_export_job')
-    }
-
-    await requestExport(supabase, orderId, {
-      actor: auth.isAdmin || auth.isOperator ? 'operator' : 'user',
-      idempotencyKey: `export:${jobRow.id}`,
-      eventPhase: 'export_stl',
-      eventMessage: 'Queued print-ready STL export',
-      eventMeta: { job_id: jobRow.id, target_max_dim_mm: target, tolerance_mm: tolerance },
-      patch: { meta_json: { cancel_requested: false } },
-    })
-    return NextResponse.json({ ok: true, jobId: jobRow.id, status: jobRow.status })
+    return await handleExportLifecycleRequest(supabase, orderId, auth, body)
   } catch (e: any) {
     if (e instanceof LifecycleTransitionError) {
       return NextResponse.json({ error: e.code }, { status: lifecycleHttpStatus(e) })

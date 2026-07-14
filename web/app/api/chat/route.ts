@@ -9,7 +9,7 @@ import { getEditProvider } from '@/lib/providers/edit'
 import { materializeSelectedImages } from '@/lib/materialize'
 import { requireAuthContext, type AuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
-import { requestDispatch, requestFabrication, requestSlice } from '@/lib/lifecycle'
+import { requestDispatch, requestFabrication, requestSliceJob } from '@/lib/lifecycle'
 
 export const runtime = 'nodejs'
 
@@ -980,42 +980,17 @@ export async function POST(req: Request) {
           if (!stlUrl) {
             return await adapter_fabricate(args)
           }
-          const { data: existingJobs } = await supabase
-            .from('export_jobs')
-            .select('id,status')
-            .eq('order_id', orderId)
-            .eq('job_type', 'slice')
-            .in('status', ['pending', 'processing'])
-            .order('created_at', { ascending: false })
-            .limit(1)
-          let jobId = existingJobs?.[0]?.id as string | undefined
-          if (!jobId) {
-            const { data: jobRow, error: jobError } = await supabase
-              .from('export_jobs')
-              .insert({
-                order_id: orderId,
-                status: 'pending',
-                job_type: 'slice',
-                requested_by: auth.user?.id ?? null,
-                meta_json: { source: 'chat', requested_at: new Date().toISOString() },
-              })
-              .select('id')
-              .single()
-            if (jobError || !jobRow?.id) throw jobError ?? new Error('failed_to_enqueue_slice_job')
-            jobId = jobRow.id
-          }
-          const transition = await requestSlice(supabase, orderId, {
+          const job = await requestSliceJob(supabase, orderId, {
             actor: auth.isAdmin || auth.isOperator ? 'operator' : 'user',
-            idempotencyKey: `chat-slice:${jobId}`,
+            requestedBy: auth.user?.id ?? null,
+            source: 'chat',
             eventMessage: 'Slice requested with STL',
-            eventMeta: { job_id: jobId, stlUrl },
-            patch: { meta_json: { cancel_requested: false } },
           })
           try {
             await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: 'Slicing the provided STL with the Bambu profile.' } })
           } catch {}
           send({ role: 'assistant', type: 'text', content: { text: 'Slicing the provided STL with the Bambu profile.' } })
-          return { ok: true, stlUrl, jobId, reused: transition.reused }
+          return { ok: true, stlUrl, jobId: job.jobId, reused: job.reused }
         }
 
         async function adapter_repair_and_validate(_args: any) {

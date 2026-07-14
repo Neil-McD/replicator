@@ -79,10 +79,17 @@ class StubSupabase {
     return {
       data: {
         ok: true,
-        previous_status: 'ready_to_pay',
-        new_status: 'exporting',
-        changed: true,
+        job_id: 'export_jobs-1',
+        job_status: 'pending',
         reused: false,
+        completed: false,
+        lifecycle: {
+          ok: true,
+          previous_status: 'ready_to_pay',
+          new_status: 'exporting',
+          changed: true,
+          reused: false,
+        },
       },
       error: null,
     }
@@ -131,11 +138,11 @@ test('handleStoreRequest queues export when only repaired STL exists', async () 
 
   assert.equal(supabase.updates.length, 0)
   assert.equal(supabase.rpcCalls.length, 1)
-  assert.equal(supabase.rpcCalls[0].name, 'transition_order_lifecycle')
-  assert.equal(supabase.rpcCalls[0].params.p_transition, 'export_requested')
+  assert.equal(supabase.rpcCalls[0].name, 'request_order_job')
+  assert.equal(supabase.rpcCalls[0].params.p_job_type, 'export')
 
   const insertedTables = supabase.inserts.map((entry) => entry.table)
-  assert.deepEqual(insertedTables.sort(), ['chat_messages', 'export_jobs'])
+  assert.deepEqual(insertedTables, ['chat_messages'])
 })
 
 test('handleStoreRequest rejects when no repaired STL is available', async () => {
@@ -186,7 +193,14 @@ test('handleStoreRequest reuses an active catalog export job', async () => {
   supabase.rpc = async (name: string, params: any) => {
     supabase.rpcCalls.push({ name, params })
     return {
-      data: { ok: true, previous_status: 'exporting', new_status: 'exporting', changed: false, reused: true },
+      data: {
+        ok: true,
+        job_id: 'existing-export',
+        job_status: 'pending',
+        reused: true,
+        completed: false,
+        lifecycle: { ok: true, previous_status: 'exporting', new_status: 'exporting', changed: false, reused: true },
+      },
       error: null,
     }
   }
@@ -198,7 +212,6 @@ test('handleStoreRequest reuses an active catalog export job', async () => {
     body: {},
   })
   assert.equal(response.status, 202)
-  assert.equal(supabase.inserts.filter((entry) => entry.table === 'export_jobs').length, 0)
   assert.equal(supabase.inserts.filter((entry) => entry.table === 'chat_messages').length, 0)
-  assert.equal(supabase.rpcCalls[0].params.p_idempotency_key, 'catalog-export:existing-export')
+  assert.equal(supabase.rpcCalls[0].name, 'request_order_job')
 })

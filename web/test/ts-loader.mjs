@@ -7,6 +7,12 @@ const testDir = path.dirname(fileURLToPath(import.meta.url))
 const webRoot = path.resolve(testDir, '..')
 
 export async function resolve(specifier, context, defaultResolve) {
+  // Node 25 no longer adds extensions for package subpath imports that Next 14
+  // publishes as files without an exports map entry.
+  if (specifier.startsWith('next/')) {
+    const withExt = await resolveWithExtensions(path.join(webRoot, 'node_modules', specifier))
+    return { url: pathToFileURL(withExt).href, shortCircuit: true }
+  }
   if (specifier.startsWith('@/')) {
     const target = path.join(webRoot, specifier.slice(2))
     const withExt = await resolveWithExtensions(target)

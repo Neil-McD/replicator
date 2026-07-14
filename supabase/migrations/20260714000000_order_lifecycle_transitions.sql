@@ -139,12 +139,28 @@ begin
     return jsonb_build_object('ok', false, 'error', 'invalid_patch', 'previous_status', v_from);
   end if;
 
+  if v_patch ? 'payment_status'
+     and (p_transition <> 'payment_completed' or v_patch->>'payment_status' <> 'paid') then
+    return jsonb_build_object('ok', false, 'error', 'invalid_patch', 'previous_status', v_from);
+  end if;
+
+  if v_patch ? 'quote_json' and p_transition <> 'quote_ready' then
+    return jsonb_build_object('ok', false, 'error', 'invalid_patch', 'previous_status', v_from);
+  end if;
+
   if p_transition = 'quote_ready' then
     v_quote := v_patch->'quote_json';
     if jsonb_typeof(v_quote) <> 'object'
        or not (v_quote ? 'minutes')
        or not (v_quote ? 'grams')
-       or not ((v_quote ? 'price_cents') or (v_quote ? 'total_cents')) then
+       or not ((v_quote ? 'price_cents') or (v_quote ? 'total_cents'))
+       or jsonb_typeof(v_quote->'minutes') <> 'number'
+       or jsonb_typeof(v_quote->'grams') <> 'number'
+       or (v_quote ? 'price_cents' and jsonb_typeof(v_quote->'price_cents') <> 'number')
+       or (v_quote ? 'total_cents' and jsonb_typeof(v_quote->'total_cents') <> 'number')
+       or (v_quote->>'minutes')::numeric <= 0
+       or (v_quote->>'grams')::numeric <= 0
+       or coalesce((v_quote->>'price_cents')::numeric, (v_quote->>'total_cents')::numeric) < 0 then
       return jsonb_build_object('ok', false, 'error', 'invalid_quote', 'previous_status', v_from);
     end if;
   end if;
@@ -199,10 +215,8 @@ begin
   set status = v_required_to,
       worker_id = case when v_patch ? 'worker_id' then nullif(v_patch->>'worker_id', '')::uuid else worker_id end,
       locked_at = case when v_patch ? 'locked_at' then nullif(v_patch->>'locked_at', '')::timestamptz else locked_at end,
-      payment_status = case when p_transition = 'payment_completed' then 'paid'
-                            when v_patch ? 'payment_status' then v_patch->>'payment_status'
-                            else payment_status end,
-      quote_json = case when v_patch ? 'quote_json' then v_patch->'quote_json' else quote_json end,
+      payment_status = case when p_transition = 'payment_completed' then 'paid' else payment_status end,
+      quote_json = case when p_transition = 'quote_ready' then v_patch->'quote_json' else quote_json end,
       meta_json = case when v_patch ? 'meta_json'
                        then coalesce(meta_json, '{}'::jsonb) || coalesce(v_patch->'meta_json', '{}'::jsonb)
                        else meta_json end
@@ -237,6 +251,220 @@ is 'Server-only authoritative command for Replicator orders.status lifecycle tra
 
 revoke all on function public.transition_order_lifecycle(uuid,text,text[],text,text,text,text,text,jsonb,jsonb) from public, anon, authenticated;
 grant execute on function public.transition_order_lifecycle(uuid,text,text[],text,text,text,text,text,jsonb,jsonb) to service_role;
+
+-- Collapse any legacy duplicate active work before enforcing one runnable work
+-- unit per order and job type. Prefer an already-processing unit, otherwise the
+-- oldest pending unit, so rollout does not interrupt work already under way.
+with ranked_active_jobs as (
+  select id,
+         row_number() over (
+           partition by order_id, job_type
+           order by case when status = 'processing' then 0 else 1 end, created_at asc, id asc
+         ) as active_rank
+  from public.export_jobs
+  where status in ('pending', 'processing')
+)
+update public.export_jobs as jobs
+set status = 'cancelled',
+    completed_at = coalesce(jobs.completed_at, now()),
+    error_message = coalesce(jobs.error_message, 'superseded_by_active_job_constraint')
+from ranked_active_jobs as ranked
+where jobs.id = ranked.id
+  and ranked.active_rank > 1;
+
+create unique index if not exists export_jobs_one_active_job_idx
+on public.export_jobs(order_id, job_type)
+where status in ('pending', 'processing');
+
+-- Atomically validates the lifecycle request and creates or reuses its queue
+-- work. The order row lock serializes concurrent callers; the partial unique
+-- index is the final invariant if another writer bypasses this command.
+create or replace function public.request_order_job(
+  p_order_id uuid,
+  p_job_type text,
+  p_actor text default 'system',
+  p_requested_by uuid default null,
+  p_target_max_dim_mm numeric default null,
+  p_target_tolerance_mm numeric default 0.1,
+  p_transform_asset_id uuid default null,
+  p_source text default 'api',
+  p_event_message text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_order public.orders;
+  v_transition jsonb;
+  v_ready_transition jsonb;
+  v_active public.export_jobs;
+  v_completed public.export_jobs;
+  v_job public.export_jobs;
+  v_transform_asset_id uuid := p_transform_asset_id;
+  v_target numeric := case when p_target_max_dim_mm is null then null else greatest(p_target_max_dim_mm, 0) end;
+  v_tolerance numeric := greatest(coalesce(p_target_tolerance_mm, 0.1), 0.1);
+  v_is_same_target boolean;
+begin
+  if p_job_type not in ('export', 'slice') then
+    return jsonb_build_object('ok', false, 'error', 'invalid_job_type');
+  end if;
+
+  select * into v_order
+  from public.orders
+  where id = p_order_id
+  for update;
+
+  if not found then
+    return jsonb_build_object('ok', false, 'error', 'not_found');
+  end if;
+
+  if not exists (
+    select 1 from public.assets
+    where order_id = p_order_id and kind = 'repaired_stl'
+  ) then
+    return jsonb_build_object('ok', false, 'error', 'missing_artifact', 'previous_status', v_order.status);
+  end if;
+
+  v_transition := public.transition_order_lifecycle(
+    p_order_id,
+    case when p_job_type = 'slice' then 'slice_requested' else 'export_requested' end,
+    null,
+    case when p_job_type = 'slice' then 'slicing' else 'exporting' end,
+    p_actor,
+    'order-job:' || p_job_type || ':' || p_order_id::text,
+    case when p_job_type = 'slice' then 'slicing' else 'export_requested' end,
+    p_event_message,
+    jsonb_build_object('job_type', p_job_type, 'source', coalesce(p_source, 'api')),
+    jsonb_build_object('meta_json', jsonb_build_object('cancel_requested', false))
+  );
+
+  if not coalesce((v_transition->>'ok')::boolean, false) then
+    return v_transition;
+  end if;
+
+  if p_job_type = 'export' then
+    select * into v_completed
+    from public.export_jobs
+    where order_id = p_order_id
+      and job_type = 'export'
+      and status = 'succeeded'
+      and asset_id is not null
+      and (
+        (target_max_dim_mm is null and v_target is null)
+        or (target_max_dim_mm is not null and v_target is not null and abs(target_max_dim_mm - v_target) <= v_tolerance)
+      )
+    order by completed_at desc nulls last, created_at desc
+    limit 1;
+
+    if found then
+      update public.export_jobs
+      set status = 'cancelled', completed_at = now(), error_message = 'superseded_by_completed_export'
+      where order_id = p_order_id
+        and job_type = 'export'
+        and status in ('pending', 'processing');
+
+      v_ready_transition := public.transition_order_lifecycle(
+        p_order_id,
+        'stl_ready',
+        null,
+        'stl_ready',
+        p_actor,
+        'order-job:export-ready:' || v_completed.id::text,
+        'stl_ready',
+        'Reusing completed print-ready STL export',
+        jsonb_build_object('job_id', v_completed.id, 'asset_id', v_completed.asset_id),
+        '{}'::jsonb
+      );
+      if not coalesce((v_ready_transition->>'ok')::boolean, false) then
+        return v_ready_transition;
+      end if;
+      return jsonb_build_object(
+        'ok', true,
+        'job_id', v_completed.id,
+        'job_status', v_completed.status,
+        'asset_id', v_completed.asset_id,
+        'reused', true,
+        'completed', true,
+        'lifecycle', v_ready_transition
+      );
+    end if;
+  end if;
+
+  select * into v_active
+  from public.export_jobs
+  where order_id = p_order_id
+    and job_type = p_job_type
+    and status in ('pending', 'processing')
+  order by case when status = 'processing' then 0 else 1 end, created_at asc
+  limit 1
+  for update;
+
+  if found then
+    v_is_same_target := p_job_type = 'slice'
+      or ((v_active.target_max_dim_mm is null and v_target is null)
+          or (v_active.target_max_dim_mm is not null and v_target is not null
+              and abs(v_active.target_max_dim_mm - v_target) <= v_tolerance));
+    if v_is_same_target then
+      return jsonb_build_object(
+        'ok', true,
+        'job_id', v_active.id,
+        'job_status', v_active.status,
+        'reused', true,
+        'completed', false,
+        'lifecycle', v_transition
+      );
+    end if;
+
+    update public.export_jobs
+    set status = 'cancelled', completed_at = now(), error_message = 'superseded_by_new_request'
+    where id = v_active.id;
+  end if;
+
+  if p_job_type = 'export' and v_target is not null and v_transform_asset_id is null then
+    insert into public.assets(order_id, kind, url, meta_json)
+    values (p_order_id, 'transform', '', jsonb_build_object('target_max_dim_mm', v_target))
+    returning id into v_transform_asset_id;
+  end if;
+
+  insert into public.export_jobs(
+    order_id,
+    status,
+    job_type,
+    target_max_dim_mm,
+    target_tolerance_mm,
+    transform_asset_id,
+    requested_by,
+    meta_json
+  ) values (
+    p_order_id,
+    'pending',
+    p_job_type,
+    v_target,
+    v_tolerance,
+    v_transform_asset_id,
+    p_requested_by,
+    jsonb_build_object('source', coalesce(p_source, 'api'), 'requested_at', now())
+  )
+  returning * into v_job;
+
+  return jsonb_build_object(
+    'ok', true,
+    'job_id', v_job.id,
+    'job_status', v_job.status,
+    'reused', false,
+    'completed', false,
+    'lifecycle', v_transition
+  );
+end;
+$$;
+
+comment on function public.request_order_job(uuid,text,text,uuid,numeric,numeric,uuid,text,text)
+is 'Server-only atomic lifecycle and export_jobs request command.';
+
+revoke all on function public.request_order_job(uuid,text,text,uuid,numeric,numeric,uuid,text,text) from public, anon, authenticated;
+grant execute on function public.request_order_job(uuid,text,text,uuid,numeric,numeric,uuid,text,text) to service_role;
 
 -- generation_tasks owns provider work; the worker performs the lifecycle transition
 -- after this atomic task claim instead of this queue RPC owning order status.

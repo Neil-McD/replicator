@@ -4,7 +4,7 @@ import { Buffer } from 'buffer'
 import { createAdminClient, parseSupabaseUrl, signedUrlOrDirect } from '@/lib/supabaseAdmin'
 import { ensureOrgForUser } from '@/lib/orgs'
 import { parseDataUrl, toNumber } from '@/lib/storeUtils'
-import { requestExport } from '@/lib/lifecycle'
+import { requestExportJob } from '@/lib/lifecycle'
 
 const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET ?? 'artifacts'
 const DEFAULT_PRICE_CENTS = Number(process.env.DEFAULT_STORE_PRICE_CENTS || 2800)
@@ -127,41 +127,15 @@ export async function handleStoreRequest(options: {
   if (!sizedAsset) {
     if (latestRepaired) {
       try {
-        const { data: activeJobs } = await supabase
-          .from('export_jobs')
-          .select('id,status')
-          .eq('order_id', orderId)
-          .eq('job_type', 'export')
-          .in('status', ['pending', 'processing'])
-          .order('created_at', { ascending: false })
-          .limit(1)
-
-        let jobId = activeJobs?.[0]?.id as string | undefined
-        if (!jobId) {
-          const { data: jobRow, error: jobError } = await supabase
-            .from('export_jobs')
-            .insert({
-              order_id: orderId,
-              status: 'pending',
-              job_type: 'export',
-              target_max_dim_mm: Number.isFinite(requestedTarget) ? requestedTarget : null,
-              target_tolerance_mm: tolerance,
-              requested_by: auth.user.id,
-              meta_json: { source: 'catalog', requested_at: new Date().toISOString() },
-            })
-            .select('id')
-            .single()
-          if (jobError || !jobRow?.id) throw jobError ?? new Error('failed_to_enqueue_export_job')
-          jobId = jobRow.id
-        }
-
-        const transition = await requestExport(supabase, orderId, {
+        const job = await requestExportJob(supabase, orderId, {
           actor: auth.isAdmin ? 'operator' : 'user',
-          idempotencyKey: `catalog-export:${jobId}`,
+          requestedBy: auth.user.id,
+          targetMaxDimMm: Number.isFinite(requestedTarget) ? requestedTarget : null,
+          targetToleranceMm: tolerance,
+          source: 'catalog',
           eventMessage: 'Catalog requested sized STL export',
-          eventMeta: { job_id: jobId, source: 'catalog' },
         })
-        if (transition.changed) {
+        if (!job.reused) {
           await supabase.from('chat_messages').insert({
             order_id: orderId,
             role: 'assistant',

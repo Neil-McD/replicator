@@ -11,32 +11,38 @@ async function source(relativePath: string) {
   return readFile(path.join(webRoot, relativePath), 'utf8')
 }
 
-test('fabricate, slice, export, and print routes use lifecycle commands', async () => {
-  const [fabricate, slice, exportStl, printNow] = await Promise.all([
+test('fabricate, slice, export, and print routes use lifecycle command handlers', async () => {
+  const [fabricate, slice, exportStl, printNow, handlers] = await Promise.all([
     source('app/api/orders/[id]/fabricate/route.ts'),
     source('app/api/orders/[id]/slice/route.ts'),
     source('app/api/orders/[id]/export-stl/route.ts'),
     source('app/api/orders/[id]/print-now/route.ts'),
+    source('lib/lifecycleRouteHandlers.ts'),
   ])
 
-  assert.match(fabricate, /requestFabrication\(supabase/)
+  assert.match(fabricate, /handleFabricationLifecycleRequest\(supabase/)
   assert.doesNotMatch(fabricate, /from\('orders'\)\.update\(\{\s*status:/)
-  assert.match(slice, /requestSlice\(supabase/)
-  assert.match(slice, /\.eq\('job_type', 'slice'\)/)
-  assert.match(exportStl, /requestExport\(supabase/)
-  assert.match(exportStl, /\.eq\('job_type', 'export'\)[\s\S]*\.in\('status', \['pending','processing'\]\)/)
-  assert.match(printNow, /auth\.isAdmin \|\| auth\.isOperator/)
-  assert.match(printNow, /requestDispatch\(supabase/)
+  assert.match(slice, /handleSliceLifecycleRequest\(supabase/)
+  assert.doesNotMatch(slice, /from\('export_jobs'\)/)
+  assert.match(exportStl, /handleExportLifecycleRequest\(supabase/)
+  assert.doesNotMatch(exportStl, /from\('export_jobs'\)/)
+  assert.match(printNow, /handlePrintNowRequest\(supabase/)
+  assert.match(handlers, /requestFabrication\(supabase/)
+  assert.match(handlers, /requestSliceJob\(supabase/)
+  assert.match(handlers, /requestExportJob\(supabase/)
+  assert.match(handlers, /requestDispatch\(supabase/)
 })
 
 test('Stripe persists paid before requesting dispatch and chat cannot mark printing', async () => {
-  const [stripe, chat] = await Promise.all([
+  const [stripe, handlers, chat] = await Promise.all([
     source('app/api/stripe/webhook/route.ts'),
+    source('lib/lifecycleRouteHandlers.ts'),
     source('app/api/chat/route.ts'),
   ])
-  const paidIndex = stripe.indexOf('await markPaid')
-  const dispatchIndex = stripe.indexOf('await requestDispatch')
+  const paidIndex = handlers.indexOf('await markPaid')
+  const dispatchIndex = handlers.indexOf('await requestDispatch', paidIndex)
   assert.ok(paidIndex >= 0 && dispatchIndex > paidIndex)
+  assert.match(stripe, /processCompletedCheckout\(supabase/)
   assert.match(chat, /if \(!\(auth\.isAdmin \|\| auth\.isOperator\)\)/)
   assert.match(chat, /requestDispatch\(supabase/)
   assert.doesNotMatch(chat, /update\(\{ status: 'printing'/)
@@ -44,8 +50,8 @@ test('Stripe persists paid before requesting dispatch and chat cannot mark print
 
 test('catalog requests queued export work without directly owning order status', async () => {
   const store = await source('lib/storeOrder.ts')
-  assert.match(store, /from\('export_jobs'\)/)
-  assert.match(store, /requestExport\(supabase/)
+  assert.match(store, /requestExportJob\(supabase/)
+  assert.doesNotMatch(store, /from\('export_jobs'\)/)
   assert.doesNotMatch(store, /from\('orders'\)\.update\(\{\s*status: 'exporting'/)
 })
 
@@ -61,6 +67,12 @@ test('migration command locks orders and enforces payment, artifact, and server-
   assert.match(migration, /kind = 'three_mf'/)
   assert.match(migration, /revoke all on function[\s\S]*from public, anon, authenticated;/i)
   assert.match(migration, /grant execute on function[\s\S]*to service_role;/i)
+  assert.match(migration, /create unique index if not exists export_jobs_one_active_job_idx/i)
+  assert.match(migration, /create or replace function public\.request_order_job/i)
+  assert.match(migration, /where order_id = p_order_id[\s\S]*and job_type = p_job_type[\s\S]*status in \('pending', 'processing'\)/i)
+  assert.match(migration, /v_patch \? 'payment_status'[\s\S]*p_transition <> 'payment_completed'/i)
+  assert.match(migration, /v_patch \? 'quote_json' and p_transition <> 'quote_ready'/i)
+  assert.match(migration, /jsonb_typeof\(v_quote->'minutes'\) <> 'number'/i)
   for (const [transition, contract] of Object.entries(LIFECYCLE_TRANSITIONS)) {
     assert.match(migration, new RegExp(`when '${transition}'[\\s\\S]*?v_required_to := '${contract.to}'`))
   }
