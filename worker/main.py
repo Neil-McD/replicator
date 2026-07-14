@@ -4335,11 +4335,10 @@ def auto_stabilize_mesh(order: Dict[str, Any], raw_kind: str, raw_url: str, raw_
             raw_asset_id = None
     thin_wall_detected = False
     thin_wall_reason: Optional[str] = None
-    try:
-        set_status(oid, 'repairing')
-        order['status'] = 'repairing'
-    except Exception:
-        pass
+    # Lifecycle authority must accept repair before repair work or artifact writes
+    # begin. Let rejection/outage propagate so the caller can retry/reconcile.
+    set_status(oid, 'repairing')
+    order['status'] = 'repairing'
     try:
         supabase_insert(
             'chat_messages',
@@ -4360,10 +4359,9 @@ def auto_stabilize_mesh(order: Dict[str, Any], raw_kind: str, raw_url: str, raw_
         return
     repair_out = repair(order, raw_url)
     if not repair_out:
-        try:
-            set_status(oid, 'repair_failed')
-        except Exception:
-            pass
+        # A failed repair is not durably handled until the authoritative lifecycle
+        # records it. Propagate transition outages rather than masking divergence.
+        set_status(oid, 'repair_failed')
         try:
             supabase_insert("chat_messages", {"order_id": oid, "role": "assistant", "type": "warning", "content_json": {"text": "Mesh repair failed. Please adjust the concept or upload a clean model."}})
         except Exception:

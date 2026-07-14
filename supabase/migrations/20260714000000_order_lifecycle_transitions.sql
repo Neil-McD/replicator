@@ -468,7 +468,12 @@ grant execute on function public.request_order_job(uuid,text,text,uuid,numeric,n
 
 -- generation_tasks owns provider work; the worker performs the lifecycle transition
 -- after this atomic task claim instead of this queue RPC owning order status.
-create or replace function public.claim_i23d_task(p_worker_id uuid)
+-- The 20251002 version has the same argument signature but returns jsonb. PostgreSQL
+-- cannot change a function return type with CREATE OR REPLACE, so remove that exact
+-- legacy signature before installing the richer worker response.
+drop function if exists public.claim_i23d_task(uuid);
+
+create function public.claim_i23d_task(p_worker_id uuid)
 returns table(order_data public.orders, task_data public.generation_tasks)
 language plpgsql
 security definer
@@ -505,3 +510,9 @@ begin
   return next;
 end;
 $$;
+
+comment on function public.claim_i23d_task(uuid)
+is 'Server-only atomic claim for the next queued i23d generation task.';
+
+revoke all on function public.claim_i23d_task(uuid) from public, anon, authenticated;
+grant execute on function public.claim_i23d_task(uuid) to service_role;

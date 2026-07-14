@@ -77,3 +77,31 @@ test('migration command locks orders and enforces payment, artifact, and server-
     assert.match(migration, new RegExp(`when '${transition}'[\\s\\S]*?v_required_to := '${contract.to}'`))
   }
 })
+
+test('migration replaces the legacy claim RPC safely and keeps worker RPCs service-role-only', async () => {
+  const migration = await readFile(
+    path.join(repoRoot, 'supabase/migrations/20260714000000_order_lifecycle_transitions.sql'),
+    'utf8',
+  )
+
+  const legacyDrop = migration.indexOf('drop function if exists public.claim_i23d_task(uuid);')
+  const replacement = migration.indexOf('create function public.claim_i23d_task(p_worker_id uuid)')
+  assert.ok(legacyDrop >= 0 && replacement > legacyDrop)
+  assert.doesNotMatch(migration, /create or replace function public\.claim_i23d_task/)
+
+  for (const signature of [
+    'public.transition_order_lifecycle(uuid,text,text[],text,text,text,text,text,jsonb,jsonb)',
+    'public.request_order_job(uuid,text,text,uuid,numeric,numeric,uuid,text,text)',
+    'public.claim_i23d_task(uuid)',
+  ]) {
+    const escapedSignature = signature.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    assert.match(
+      migration,
+      new RegExp(`revoke all on function ${escapedSignature} from public, anon, authenticated;`, 'i'),
+    )
+    assert.match(
+      migration,
+      new RegExp(`grant execute on function ${escapedSignature} to service_role;`, 'i'),
+    )
+  }
+})

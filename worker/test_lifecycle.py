@@ -146,6 +146,57 @@ def test_slice_job_stops_before_slicing_when_transition_is_rejected(monkeypatch)
     assert updates[0]["status"] == "failed"
 
 
+def test_auto_stabilize_stops_before_repair_when_lifecycle_is_unavailable(monkeypatch):
+    import main
+    import pytest
+
+    operations = []
+    monkeypatch.setattr(main, "_skip_if_cancelled", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        main,
+        "set_status",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("lifecycle unavailable")),
+    )
+    monkeypatch.setattr(main, "repair", lambda *_args, **_kwargs: operations.append("repair_executed"))
+    monkeypatch.setattr(main, "supabase_insert", lambda *_args, **_kwargs: operations.append("insert_executed"))
+
+    with pytest.raises(RuntimeError, match="lifecycle unavailable"):
+        main.auto_stabilize_mesh(
+            {"id": "order-stabilize", "status": "generating"},
+            "raw_glb",
+            "https://example.com/raw.glb",
+        )
+
+    assert operations == []
+
+
+def test_auto_stabilize_propagates_repair_failure_transition_outage(monkeypatch):
+    import main
+    import pytest
+
+    transitions = []
+
+    def set_status(_order_id, status):
+        transitions.append(status)
+        if status == "repair_failed":
+            raise RuntimeError("lifecycle unavailable")
+        return {"ok": True}
+
+    monkeypatch.setattr(main, "_skip_if_cancelled", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(main, "set_status", set_status)
+    monkeypatch.setattr(main, "repair", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "supabase_insert", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="lifecycle unavailable"):
+        main.auto_stabilize_mesh(
+            {"id": "order-repair-failed", "status": "generating"},
+            "raw_glb",
+            "https://example.com/raw.glb",
+        )
+
+    assert transitions == ["repairing", "repair_failed"]
+
+
 def test_claim_requeues_task_and_returns_none_when_lifecycle_rpc_is_unavailable(monkeypatch):
     import main
 
