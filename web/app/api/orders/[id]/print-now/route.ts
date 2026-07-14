@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { createAdminClient, signedUrlOrDirect } from '@/lib/supabaseAdmin'
 import { requireAuthContext } from '@/lib/apiAuth'
+import { LifecycleTransitionError, lifecycleHttpStatus, requestDispatch } from '@/lib/lifecycle'
 
 export async function POST(req: Request, { params }: { params: { id: string } }) {
   try {
@@ -25,9 +26,18 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     if (!asset) return NextResponse.json({ error: '3MF not found' }, { status: 404 })
     const signed = await signedUrlOrDirect(asset.url)
     const link = `bambu-connect://import-file?file=${encodeURIComponent(signed)}`
-    await supabase.from('orders').update({ status: 'dispatching' }).eq('id', params.id)
-    return NextResponse.json({ link })
+    const transition = await requestDispatch(supabase, params.id, {
+      actor: 'operator',
+      idempotencyKey: `print-now:${asset.id}`,
+      eventMessage: 'Operator requested printer dispatch',
+      eventMeta: { asset_id: asset.id },
+      patch: { worker_id: null, locked_at: null },
+    })
+    return NextResponse.json({ link, status: transition.newStatus, reused: transition.reused })
   } catch (e: any) {
+    if (e instanceof LifecycleTransitionError) {
+      return NextResponse.json({ error: e.code }, { status: lifecycleHttpStatus(e) })
+    }
     // Swallow detailed server logs; return minimal error
     return NextResponse.json({ error: e.message || 'failed' }, { status: 500 })
   }

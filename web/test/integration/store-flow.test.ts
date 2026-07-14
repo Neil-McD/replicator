@@ -1,16 +1,18 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { handleStoreRequest } from '@/app/api/orders/[id]/store/route'
+import { handleStoreRequest } from '@/lib/storeOrder'
 
 class StubSupabase {
   tables: Record<string, any>
   updates: Array<{ table: string; payload: any; filters: Array<{ column: string; value: any }> }>
   inserts: Array<{ table: string; payload: any }>
+  rpcCalls: Array<{ name: string; params: any }>
 
   constructor(tables: Record<string, any>) {
     this.tables = tables
     this.updates = []
     this.inserts = []
+    this.rpcCalls = []
   }
 
   from(table: string) {
@@ -18,6 +20,7 @@ class StubSupabase {
     const tableData = this.tables[table]
     return new (class {
       filters: Array<{ column: string; value: any }> = []
+      insertedPayload: any = null
 
       select() {
         return this
@@ -31,6 +34,11 @@ class StubSupabase {
         return Promise.resolve({ data: tableData ?? [], error: null })
       }
 
+      in(column: string, value: any) {
+        this.filters.push({ column, value })
+        return this
+      }
+
       eq(column: string, value: any) {
         this.filters.push({ column, value })
         return this
@@ -41,12 +49,16 @@ class StubSupabase {
       }
 
       single() {
+        if (this.insertedPayload) {
+          return Promise.resolve({ data: { id: `${table}-1`, ...this.insertedPayload }, error: null })
+        }
         return Promise.resolve({ data: tableData ?? null, error: null })
       }
 
       insert(payload: any) {
         self.inserts.push({ table, payload })
-        return Promise.resolve({ data: null, error: null })
+        this.insertedPayload = payload
+        return this
       }
 
       update(payload: any) {
@@ -60,6 +72,20 @@ class StubSupabase {
         }
       }
     })()
+  }
+
+  async rpc(name: string, params: any) {
+    this.rpcCalls.push({ name, params })
+    return {
+      data: {
+        ok: true,
+        previous_status: 'ready_to_pay',
+        new_status: 'exporting',
+        changed: true,
+        reused: false,
+      },
+      error: null,
+    }
   }
 
   storage = {
@@ -98,17 +124,18 @@ test('handleStoreRequest queues export when only repaired STL exists', async () 
   const auth = { isAdmin: false, user: { id: 'user-1' } }
   const body = {}
 
-  const response = await handleStoreRequest({ supabase, auth, orderId, body })
+  const response = await handleStoreRequest({ supabase: supabase as any, auth, orderId, body })
   assert.equal(response.status, 202)
   const payload = await response.json()
   assert.equal(payload.status, 'pending_export')
 
-  assert.equal(supabase.updates.length, 1)
-  assert.equal(supabase.updates[0].table, 'orders')
-  assert.equal(supabase.updates[0].payload.status, 'exporting')
+  assert.equal(supabase.updates.length, 0)
+  assert.equal(supabase.rpcCalls.length, 1)
+  assert.equal(supabase.rpcCalls[0].name, 'transition_order_lifecycle')
+  assert.equal(supabase.rpcCalls[0].params.p_transition, 'export_requested')
 
   const insertedTables = supabase.inserts.map((entry) => entry.table)
-  assert.deepEqual(insertedTables.sort(), ['chat_messages', 'order_events'])
+  assert.deepEqual(insertedTables.sort(), ['chat_messages', 'export_jobs'])
 })
 
 test('handleStoreRequest rejects when no repaired STL is available', async () => {
@@ -132,8 +159,46 @@ test('handleStoreRequest rejects when no repaired STL is available', async () =>
   const auth = { isAdmin: false, user: { id: 'user-1' } }
   const body = {}
 
-  const response = await handleStoreRequest({ supabase, auth, orderId, body })
+  const response = await handleStoreRequest({ supabase: supabase as any, auth, orderId, body })
   assert.equal(response.status, 409)
   const payload = await response.json()
   assert.equal(payload.error, 'sized_asset_missing')
+})
+
+test('handleStoreRequest reuses an active catalog export job', async () => {
+  const orderId = 'order-345'
+  const supabase = new StubSupabase({
+    orders: {
+      id: orderId,
+      user_id: 'user-1',
+      org_id: 'org-1',
+      prompt_text: 'Reusable export',
+      material: 'PLA',
+      quote_json: {},
+      meta_json: {},
+      style: null,
+      chosen_image_id: null,
+      status: 'exporting',
+    },
+    assets: [{ id: 'asset-stl', kind: 'repaired_stl', url: 'supabase://artifacts/order-345/mesh.stl', meta_json: {} }],
+    export_jobs: [{ id: 'existing-export', status: 'pending' }],
+  })
+  supabase.rpc = async (name: string, params: any) => {
+    supabase.rpcCalls.push({ name, params })
+    return {
+      data: { ok: true, previous_status: 'exporting', new_status: 'exporting', changed: false, reused: true },
+      error: null,
+    }
+  }
+
+  const response = await handleStoreRequest({
+    supabase: supabase as any,
+    auth: { isAdmin: false, user: { id: 'user-1' } },
+    orderId,
+    body: {},
+  })
+  assert.equal(response.status, 202)
+  assert.equal(supabase.inserts.filter((entry) => entry.table === 'export_jobs').length, 0)
+  assert.equal(supabase.inserts.filter((entry) => entry.table === 'chat_messages').length, 0)
+  assert.equal(supabase.rpcCalls[0].params.p_idempotency_key, 'catalog-export:existing-export')
 })

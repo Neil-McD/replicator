@@ -6,6 +6,7 @@ import math
 from typing import Optional, Dict, Any, Tuple, List, Set
 import shutil
 import httpx
+from lifecycle import LifecycleTransitionError, transition_quote_ready, transition_status
 from tenacity import retry, wait_fixed, stop_after_attempt
 import subprocess
 import shlex
@@ -1446,6 +1447,8 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
             row = claimed[0]
             order_data = row.get("order_data") if isinstance(row, dict) else None
             if isinstance(order_data, dict) and order_data.get("id"):
+                set_status(order_data["id"], "generating")
+                order_data["status"] = "generating"
                 _claim_backoff_reset()
                 return order_data
     except Exception as exc:
@@ -1458,8 +1461,9 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
             t = tasks[0]
             oid = t.get("order_id")
             if oid:
-                # Mark order as generating and task as running
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"status": "generating", "worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+                # Queue state remains on generation_tasks; lifecycle state uses the command RPC.
+                set_status(oid, "generating")
+                supabase_patch("orders", {"id": f"eq.{oid}"}, {"worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
                 try:
                     supabase_patch(
                         "generation_tasks",
@@ -1528,7 +1532,8 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
             has_image = any((u.get("kind") == "upload_image") for u in ups)
             has_model = any((u.get("kind") in ("upload_stl","upload_obj","upload_glb")) for u in ups)
             if has_image or has_model:
-                supabase_patch("orders", {"id": f"eq.{oid}"}, {"status": "generating", "worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+                set_status(oid, "generating")
+                supabase_patch("orders", {"id": f"eq.{oid}"}, {"worker_id": WORKER_ID, "locked_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
                 _claim_backoff_reset()
                 return o
     except Exception:
@@ -1561,14 +1566,31 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
 
 def set_status(order_id: str, status: str):
     target_status = str(status)
-    params: Dict[str, Any] = {"id": f"eq.{order_id}"}
-    # Do not overwrite a client-requested cancellation with later worker updates.
-    if target_status.lower() != "cancelled":
-        params["status"] = "neq.cancelled"
-    try:
+    fallback_enabled = os.environ.get("LIFECYCLE_DIRECT_STATUS_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
+
+    def compatibility_fallback():
+        params: Dict[str, Any] = {"id": f"eq.{order_id}"}
+        if target_status.lower() != "cancelled":
+            params["status"] = "neq.cancelled"
         supabase_patch("orders", params, {"status": target_status})
-    except Exception as exc:
+        log(f"[status] compatibility fallback set {target_status} for order {order_id}", level="warning")
+
+    try:
+        transition_status(supabase_rpc, order_id, target_status)
+        return
+    except LifecycleTransitionError as exc:
+        if exc.code == "cancelled" or exc.previous_status == "cancelled":
+            log(f"[status] preserved cancelled order {order_id}; ignored {target_status}")
+            return
+        if fallback_enabled:
+            compatibility_fallback()
+            return
         log(f"[status] failed to set {target_status} for order {order_id}: {exc}")
+    except Exception as exc:
+        if fallback_enabled:
+            compatibility_fallback()
+            return
+        log(f"[status] lifecycle RPC failed for {target_status} on order {order_id}: {exc}", level="error")
 
 
 def reload_order(order_id: str) -> Optional[Dict[str, Any]]:
@@ -2093,8 +2115,6 @@ def _process_sized_export_job(job: Dict[str, Any]) -> bool:
             target_mm=target_mm,
         )
         set_status(order_id, 'exporting')
-        if target_mm is None or target_mm <= 0:
-            raise RuntimeError('invalid_target_mm')
         rep = latest_asset(order_id, 'repaired_stl')
         if not rep:
             raise RuntimeError('No repaired STL found for export')
@@ -4381,11 +4401,8 @@ def auto_stabilize_mesh(order: Dict[str, Any], raw_kind: str, raw_url: str, raw_
             supabase_insert('order_events', {'order_id': oid, 'phase': phase, 'message': msg, 'meta_json': slice_check})
         except Exception:
             pass
-    try:
-        set_status(oid, 'visualizing')
-        order['status'] = 'visualizing'
-    except Exception:
-        pass
+    set_status(oid, 'stl_ready')
+    order['status'] = 'stl_ready'
     try:
         supabase_insert("order_events", {"order_id": oid, "phase": "stabilized", "message": "Mesh stabilized", "meta_json": {'floating_component_count': floating_count, 'orientation': orient_summary}})
     except Exception:
@@ -5231,8 +5248,7 @@ def process_slicing(order: Dict[str, Any]) -> bool:
         three_mf_meta = dict(asset_meta_base)
         three_mf_meta['asset_role'] = 'toolpath'
         attach_asset(oid, "three_mf", three_mf_url, three_mf_sha, three_mf_meta)
-    supabase_patch("orders", {"id": f"eq.{oid}"}, {"quote_json": quote, "status": "ready_to_pay"})
-    supabase_insert("order_events", {"order_id": oid, "phase": "ready_to_pay", "message": "Quote ready", "meta_json": quote})
+    transition_quote_ready(supabase_rpc, oid, quote)
     record_domain_event(
         org_id=order.get("org_id"),
         order_id=oid,
@@ -5756,7 +5772,6 @@ def loop_once():
         if _skip_if_cancelled(oid, "post_raw_asset"):
             return True
         _mark_latest_i23d_task(oid, "succeeded")
-        set_status(oid, "visualizing")
         event_meta = {"asset_kind": raw_kind}
         if stage_label:
             event_meta["materialize_stage"] = stage_label

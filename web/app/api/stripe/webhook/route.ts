@@ -2,6 +2,7 @@ import { headers } from 'next/headers'
 import { NextResponse } from 'next/server'
 import Stripe from 'stripe'
 import { createAdminClient } from '@/lib/supabaseAdmin'
+import { markPaid, requestDispatch } from '@/lib/lifecycle'
 
 export const runtime = 'nodejs'
 
@@ -19,19 +20,27 @@ export async function POST(req: Request) {
       const order_id = session.metadata?.order_id
       if (order_id) {
         const supabase = createAdminClient()
-        await supabase
+        const { data: existingPayments } = await supabase
           .from('payments')
-          .insert({ order_id, provider_ref: session.id, amount_cents: session.amount_total || 0, status: 'succeeded' })
-        await supabase
-          .from('orders')
-          .update({ status: 'dispatching', payment_status: 'paid' })
-          .eq('id', order_id)
-        await supabase
-          .from('order_events')
-          .insert([
-            { order_id, phase: 'paid', message: 'Stripe checkout completed' },
-            { order_id, phase: 'dispatching', message: 'Preparing dispatch to printer' },
-          ])
+          .select('id')
+          .eq('provider_ref', session.id)
+          .limit(1)
+        if (!existingPayments?.length) {
+          await supabase
+            .from('payments')
+            .insert({ order_id, provider_ref: session.id, amount_cents: session.amount_total || 0, status: 'succeeded' })
+        }
+        await markPaid(supabase, order_id, {
+          actor: 'stripe',
+          idempotencyKey: `stripe:${session.id}:paid`,
+          eventMessage: 'Stripe checkout completed',
+        })
+        await requestDispatch(supabase, order_id, {
+          actor: 'system',
+          idempotencyKey: `stripe:${session.id}:dispatch`,
+          eventMessage: 'Preparing dispatch to printer',
+          patch: { worker_id: null, locked_at: null },
+        })
       }
     }
     return new NextResponse(null, { status: 200 })

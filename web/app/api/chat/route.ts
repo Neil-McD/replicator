@@ -7,8 +7,9 @@ import { tools as TOOL_REGISTRY } from '@/lib/tools'
 import { getT2IProvider } from '@/lib/providers/t2i'
 import { getEditProvider } from '@/lib/providers/edit'
 import { materializeSelectedImages } from '@/lib/materialize'
-import { requireAuthContext } from '@/lib/apiAuth'
+import { requireAuthContext, type AuthContext } from '@/lib/apiAuth'
 import { requireOrderAccess, handleOrderAccessError } from '@/lib/orderAccess'
+import { requestDispatch, requestFabrication, requestSlice } from '@/lib/lifecycle'
 
 export const runtime = 'nodejs'
 
@@ -82,7 +83,7 @@ const ATTACHMENT_PROMPT = 'Describe how you want Atom to use these images.'
 
 export async function POST(req: Request) {
   try {
-    let auth
+    let auth: AuthContext
     try {
       auth = await requireAuthContext(req)
     } catch (error: any) {
@@ -90,9 +91,10 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'not_authenticated' }, { status })
     }
     const supabase = createAdminClient()
-    const { orderId, message } = (await req.json().catch(() => ({}))) as { orderId?: string; message?: string }
-    if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 })
+    const { orderId: requestedOrderId, message } = (await req.json().catch(() => ({}))) as { orderId?: string; message?: string }
+    if (!requestedOrderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 })
     if (!message || typeof message !== 'string') return NextResponse.json({ error: 'message required' }, { status: 400 })
+    const orderId = requestedOrderId
     try {
       await requireOrderAccess(supabase, orderId, auth, 'id,user_id,status')
     } catch (error: any) {
@@ -394,7 +396,7 @@ export async function POST(req: Request) {
             try { snap = await buildContextSnapshot(orderId, { maxImages, maxAngles }) } catch {}
             if (snap) {
               messages = [
-                { role: 'system', content: `FACTS: ${JSON.stringify({ status: snap.status, quote: snap.quote, selected_image_id: snap.selected_image_id, chosen_index: snap.chosen_index, images: (snap.images||[]).map(x=>x.id).slice(0, maxImages), angles: (snap.angles||[]).map(a=>({ parent_image_id:a.parent_image_id, parent_index:a.parent_index||null, labels:a.labels, image_ids:a.image_ids })), last_angles_parent_id: snap.last_angles_parent_id||null, has_stl: !!snap.geometry?.stl_url })}` },
+                { role: 'system', content: `FACTS: ${JSON.stringify({ status: snap.status, quote: snap.quote, selected_image_id: snap.selected_image_id, chosen_index: snap.chosen_index, images: (snap.images||[]).map((x: any)=>x.id).slice(0, maxImages), angles: (snap.angles||[]).map((a: any)=>({ parent_image_id:a.parent_image_id, parent_index:a.parent_index||null, labels:a.labels, image_ids:a.image_ids })), last_angles_parent_id: snap.last_angles_parent_id||null, has_stl: !!snap.geometry?.stl_url })}` },
                 ...messages,
               ]
             }
@@ -945,34 +947,22 @@ export async function POST(req: Request) {
         }
 
         async function adapter_fabricate(_args: any) {
-          try {
-            const { data: row } = await supabase.from('orders').select('meta_json').eq('id', orderId).single()
-            const prev = (row?.meta_json as any) || {}
-            const next = { ...(typeof prev === 'object' && prev ? prev : {}), cancel_requested: false }
-            await supabase.from('orders').update({ meta_json: next }).eq('id', orderId)
-          } catch {}
-          const { data: orderRow } = await supabase.from('orders').select('status').eq('id', orderId).single()
-          const status = (orderRow?.status ?? null) as string | null
-          const busy = new Set(['fabrication_requested','repairing','slicing','stl_ready','ready_to_pay','paid','dispatching','printing'])
-          if (status && busy.has(status)) {
-            return { ok: true, status }
+          const transition = await requestFabrication(supabase, orderId, {
+            actor: auth.isAdmin || auth.isOperator ? 'operator' : 'user',
+            idempotencyKey: `chat-fabricate:${orderId}`,
+            eventMessage: 'Assistant requested fabrication',
+            patch: { worker_id: null, locked_at: null, meta_json: { cancel_requested: false } },
+          })
+          if (transition.changed) {
+            try {
+              await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: 'On it — stabilizing the mesh for a print-ready quote.' } })
+            } catch {}
+            send({ role: 'assistant', type: 'text', content: { text: 'On it — stabilizing the mesh for a print-ready quote.' } })
           }
-          await supabase.from('orders').update({ status: 'fabrication_requested', worker_id: null, locked_at: null }).eq('id', orderId)
-          await supabase.from('order_events').insert({ order_id: orderId, phase: 'fabrication_requested', message: 'Assistant requested fabrication' })
-          try {
-            await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: 'On it — stabilizing the mesh for a print-ready quote.' } })
-          } catch {}
-          send({ role: 'assistant', type: 'text', content: { text: 'On it — stabilizing the mesh for a print-ready quote.' } })
-          return { ok: true, status: 'fabrication_requested' }
+          return { ok: true, status: transition.newStatus, reused: transition.reused }
         }
 
         async function adapter_slice_and_quote(args: any) {
-          try {
-            const { data: row } = await supabase.from('orders').select('meta_json').eq('id', orderId).single()
-            const prev = (row?.meta_json as any) || {}
-            const next = { ...(typeof prev === 'object' && prev ? prev : {}), cancel_requested: false }
-            await supabase.from('orders').update({ meta_json: next }).eq('id', orderId)
-          } catch {}
           // Require a repaired STL, either from args or latest asset
           let stlUrl: string | null = (args?.stlUrl as string) || null
           if (!stlUrl) {
@@ -990,13 +980,42 @@ export async function POST(req: Request) {
           if (!stlUrl) {
             return await adapter_fabricate(args)
           }
-          await supabase.from('orders').update({ status: 'fabrication_requested', worker_id: null, locked_at: null }).eq('id', orderId)
-          await supabase.from('order_events').insert({ order_id: orderId, phase: 'fabrication_requested', message: 'Slice requested with STL', meta_json: { stlUrl } })
+          const { data: existingJobs } = await supabase
+            .from('export_jobs')
+            .select('id,status')
+            .eq('order_id', orderId)
+            .eq('job_type', 'slice')
+            .in('status', ['pending', 'processing'])
+            .order('created_at', { ascending: false })
+            .limit(1)
+          let jobId = existingJobs?.[0]?.id as string | undefined
+          if (!jobId) {
+            const { data: jobRow, error: jobError } = await supabase
+              .from('export_jobs')
+              .insert({
+                order_id: orderId,
+                status: 'pending',
+                job_type: 'slice',
+                requested_by: auth.user?.id ?? null,
+                meta_json: { source: 'chat', requested_at: new Date().toISOString() },
+              })
+              .select('id')
+              .single()
+            if (jobError || !jobRow?.id) throw jobError ?? new Error('failed_to_enqueue_slice_job')
+            jobId = jobRow.id
+          }
+          const transition = await requestSlice(supabase, orderId, {
+            actor: auth.isAdmin || auth.isOperator ? 'operator' : 'user',
+            idempotencyKey: `chat-slice:${jobId}`,
+            eventMessage: 'Slice requested with STL',
+            eventMeta: { job_id: jobId, stlUrl },
+            patch: { meta_json: { cancel_requested: false } },
+          })
           try {
             await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: 'Slicing the provided STL with the Bambu profile.' } })
           } catch {}
           send({ role: 'assistant', type: 'text', content: { text: 'Slicing the provided STL with the Bambu profile.' } })
-          return { ok: true, stlUrl }
+          return { ok: true, stlUrl, jobId, reused: transition.reused }
         }
 
         async function adapter_repair_and_validate(_args: any) {
@@ -1051,20 +1070,26 @@ export async function POST(req: Request) {
             throw new Error('no_mesh_available')
           }
 
-          await supabase.from('orders').update({ status: 'fabrication_requested', worker_id: null, locked_at: null }).eq('id', orderId)
-          try {
-            await supabase.from('order_events').insert({ order_id: orderId, phase: 'fabrication_requested', message: 'Repair requested via chat tool', meta_json: { requested_by: 'chat', intent: 'repair' } })
-          } catch {}
+          const transition = await requestFabrication(supabase, orderId, {
+            actor: auth.isAdmin || auth.isOperator ? 'operator' : 'user',
+            idempotencyKey: `chat-repair:${orderId}`,
+            eventMessage: 'Repair requested via chat tool',
+            eventMeta: { requested_by: 'chat', intent: 'repair' },
+            patch: { worker_id: null, locked_at: null, meta_json: { cancel_requested: false } },
+          })
           try {
             await supabase.rpc('merge_order_facts', { p_order_id: orderId, p_facts: { fabrication_intent: 'repair' } })
           } catch {}
           const txt = 'Stabilizing the mesh — I’ll drop the repaired STL here once it passes checks.'
           try { await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: txt } }) } catch {}
           send({ role: 'assistant', type: 'text', content: { text: txt } })
-          return { ok: true, status: 'fabrication_requested' }
+          return { ok: true, status: transition.newStatus, reused: transition.reused }
         }
 
         async function adapter_dispatch_print(args: any) {
+          if (!(auth.isAdmin || auth.isOperator)) {
+            throw new Error('forbidden')
+          }
           let threeMfUrl: string | null = typeof args?.threeMfUrl === 'string' && args.threeMfUrl ? args.threeMfUrl : null
           if (!threeMfUrl) {
             const { data: three } = await supabase
@@ -1084,23 +1109,17 @@ export async function POST(req: Request) {
           try { signed = (await signedUrlWithInfo(canonicalThreeMf)).url } catch {}
           const link = buildBambuConnectLink(signed)
 
-          const { data: orderRow } = await supabase.from('orders').select('status').eq('id', orderId).single()
-          const currentStatus = orderRow?.status || null
-
-          if (currentStatus !== 'printing') {
-            await supabase.from('orders').update({ status: 'dispatching', worker_id: null, locked_at: null }).eq('id', orderId)
-            try {
-              await supabase.from('order_events').insert({ order_id: orderId, phase: 'dispatching', message: 'Dispatch link issued (chat)', meta_json: { link } })
-            } catch {}
-            await supabase.from('orders').update({ status: 'printing', worker_id: null, locked_at: null }).eq('id', orderId)
-            try {
-              await supabase.from('order_events').insert({ order_id: orderId, phase: 'printing', message: 'Awaiting operator print' })
-            } catch {}
-          }
+          const transition = await requestDispatch(supabase, orderId, {
+            actor: 'operator',
+            idempotencyKey: `chat-dispatch:${canonicalThreeMf}`,
+            eventMessage: 'Dispatch link issued (chat)',
+            eventMeta: { link },
+            patch: { worker_id: null, locked_at: null },
+          })
 
           try { await supabase.from('chat_messages').insert({ order_id: orderId, role: 'assistant', type: 'text', content_json: { text: `Open to print: ${link}` } }) } catch {}
           send({ role: 'assistant', type: 'text', content: { text: `Open to print: ${link}` } })
-          return { ok: true, link }
+          return { ok: true, link, status: transition.newStatus, reused: transition.reused }
         }
 
         async function executeTool(name: string, args: any) {

@@ -13,10 +13,18 @@ export async function resolve(specifier, context, defaultResolve) {
     return { url: pathToFileURL(withExt).href, shortCircuit: true }
   }
   if (specifier.startsWith('./') || specifier.startsWith('../')) {
-    const parentURL = context.parentURL ? fileURLToPath(context.parentURL) : webRoot
-    const resolved = path.resolve(path.dirname(parentURL), specifier)
-    const withExt = await resolveWithExtensions(resolved)
-    return { url: pathToFileURL(withExt).href, shortCircuit: true }
+    try {
+      return await defaultResolve(specifier, context, defaultResolve)
+    } catch (err) {
+      const parentURL = context.parentURL ? fileURLToPath(context.parentURL) : webRoot
+      const resolved = path.resolve(path.dirname(parentURL), specifier)
+      try {
+        const withExt = await resolveWithExtensions(resolved)
+        return { url: pathToFileURL(withExt).href, shortCircuit: true }
+      } catch {
+        throw err
+      }
+    }
   }
   try {
     return await defaultResolve(specifier, context, defaultResolve)

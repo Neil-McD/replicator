@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { createAdminClient } from '@/lib/supabaseAdmin'
 import { requireAuthContext } from '@/lib/apiAuth'
+import { LifecycleTransitionError, lifecycleHttpStatus, markStlReady, requestExport } from '@/lib/lifecycle'
 
 const DEFAULT_TARGET_TOLERANCE_MM = 0.1
 
@@ -11,6 +12,7 @@ function normalizeTarget(value: any): number | null {
 }
 
 function approxMatch(a: number | null, b: number | null, tolerance: number): boolean {
+  if (a == null && b == null) return true
   if (a == null || b == null) return false
   return Math.abs(a - b) <= tolerance
 }
@@ -49,14 +51,6 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     const maxTarget = Math.max(20, Number(process.env.MAX_TARGET_DIM_MM || 230))
     const target = rawTarget != null ? Math.min(rawTarget, maxTarget) : null
     const tolerance = Math.max(0.1, rawTolerance ?? DEFAULT_TARGET_TOLERANCE_MM)
-
-    // Clear any prior cancel flag since the user explicitly requested a new export
-    try {
-      const { data: row } = await supabase.from('orders').select('meta_json').eq('id', orderId).single()
-      const prev = (row?.meta_json as any) || {}
-      const next = { ...(typeof prev === 'object' && prev ? prev : {}), cancel_requested: false }
-      await supabase.from('orders').update({ meta_json: next }).eq('id', orderId)
-    } catch {}
 
     // Guard: require a repaired STL to exist before queuing an export.
     // This mirrors the worker's expectation (it reads latest 'repaired_stl').
@@ -109,6 +103,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       .from('export_jobs')
       .select('id,status,target_max_dim_mm,asset_id,completed_at')
       .eq('order_id', orderId)
+      .eq('job_type', 'export')
       .order('created_at', { ascending: false })
       .limit(10)
 
@@ -119,18 +114,36 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     const jobs = Array.isArray(existingJobs) ? existingJobs : []
     const pendingJob = jobs.find((job: any) => ['pending', 'processing'].includes(String(job.status || '').toLowerCase()) && approxMatch(normalizeTarget(job.target_max_dim_mm), target, tolerance))
     if (pendingJob) {
+      await requestExport(supabase, orderId, {
+        actor: auth.isAdmin || auth.isOperator ? 'operator' : 'user',
+        idempotencyKey: `export:${pendingJob.id}`,
+        eventMessage: 'Print-ready STL export already queued',
+        patch: { meta_json: { cancel_requested: false } },
+      })
       return NextResponse.json({ ok: true, jobId: pendingJob.id, status: pendingJob.status, reused: true })
     }
 
     const succeededJob = jobs.find((job: any) => String(job.status || '').toLowerCase() === 'succeeded' && job.asset_id && approxMatch(normalizeTarget(job.target_max_dim_mm), target, tolerance))
     if (succeededJob) {
-      await supabase.from('orders').update({ status: 'stl_ready' }).eq('id', orderId)
+      await requestExport(supabase, orderId, {
+        actor: auth.isAdmin || auth.isOperator ? 'operator' : 'user',
+        idempotencyKey: `export-reuse:${succeededJob.id}`,
+        eventMessage: 'Reusing completed print-ready STL export',
+        patch: { meta_json: { cancel_requested: false } },
+      })
+      await markStlReady(supabase, orderId, {
+        actor: 'system',
+        idempotencyKey: `export-ready:${succeededJob.id}`,
+        eventMessage: 'Print-ready STL available',
+        eventMeta: { job_id: succeededJob.id, asset_id: succeededJob.asset_id },
+      })
       return NextResponse.json({ ok: true, jobId: succeededJob.id, status: succeededJob.status, reused: true, assetId: succeededJob.asset_id })
     }
 
     const insertPayload: any = {
       order_id: orderId,
       status: 'pending',
+      job_type: 'export',
       target_max_dim_mm: target,
       target_tolerance_mm: tolerance,
       requested_by: auth.user?.id ?? null,
@@ -144,6 +157,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
         .from('export_jobs')
         .update({ status: 'cancelled' })
         .eq('order_id', orderId)
+        .eq('job_type', 'export')
         .in('status', ['pending','processing'])
     } catch {}
 
@@ -156,15 +170,19 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       throw jobErr || new Error('failed_to_enqueue_export_job')
     }
 
-    await supabase.from('orders').update({ status: 'exporting' }).eq('id', orderId)
-    await supabase.from('order_events').insert({
-      order_id: orderId,
-      phase: 'export_stl',
-      message: 'Queued print-ready STL export',
-      meta_json: { job_id: jobRow.id, target_max_dim_mm: target, tolerance_mm: tolerance },
+    await requestExport(supabase, orderId, {
+      actor: auth.isAdmin || auth.isOperator ? 'operator' : 'user',
+      idempotencyKey: `export:${jobRow.id}`,
+      eventPhase: 'export_stl',
+      eventMessage: 'Queued print-ready STL export',
+      eventMeta: { job_id: jobRow.id, target_max_dim_mm: target, tolerance_mm: tolerance },
+      patch: { meta_json: { cancel_requested: false } },
     })
     return NextResponse.json({ ok: true, jobId: jobRow.id, status: jobRow.status })
   } catch (e: any) {
+    if (e instanceof LifecycleTransitionError) {
+      return NextResponse.json({ error: e.code }, { status: lifecycleHttpStatus(e) })
+    }
     return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 })
   }
 }
