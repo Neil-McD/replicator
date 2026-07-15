@@ -1435,12 +1435,25 @@ def claim_next_order() -> Optional[Dict[str, Any]]:
     """Claim the next actionable order.
 
     Priority:
-    1) Orders with a queued i23d generation_task (created by /api/materialize)
-    2) Orders with status='new' that have at least one 'upload_image' asset
-    3) (Last resort) Old behavior via RPC or first 'new' order
+    1) Orders with status='dispatching' through the atomic dispatch lease RPC
+    2) Orders with a queued i23d generation_task (created by /api/materialize)
+    3) Existing slicing, fabrication, export, and uploaded-asset paths
+    4) (Last resort) Old behavior via RPC or first 'new' order
     """
     _claim_backoff_wait()
-    # 0) Prefer queued i23d tasks via atomic RPC
+
+    # 0) Claim dispatch work atomically without changing its lifecycle status.
+    # Web dispatch requests clear any prior worker lease; a stale lease is
+    # reclaimed by the server-only RPC after its timeout.
+    try:
+        claimed = supabase_rpc("claim_dispatching_order", {"p_worker_id": WORKER_ID})
+        if claimed and isinstance(claimed, dict) and claimed.get("id"):
+            _claim_backoff_reset()
+            return claimed
+    except Exception as exc:
+        log(f"[claim] claim_dispatching_order RPC failed: {exc}", level="error")
+
+    # 0a) Prefer queued i23d tasks via atomic RPC
     try:
         claimed = supabase_rpc("claim_i23d_task", {"p_worker_id": WORKER_ID})
         if claimed and isinstance(claimed, list) and claimed:

@@ -257,6 +257,38 @@ def test_dispatch_transitions_to_printing_then_emits_bambu_link(monkeypatch):
     assert printing_index < link_index
 
 
+def test_worker_claims_dispatching_order_then_prints_and_emits_bambu_link(monkeypatch):
+    import main
+
+    operations = []
+    rpc_calls = []
+
+    def rpc(name, params):
+        rpc_calls.append((name, params))
+        if name == "claim_dispatching_order":
+            return {"id": "order-dispatch-claimed", "status": "dispatching"}
+        raise AssertionError(f"unexpected RPC: {name}")
+
+    monkeypatch.setattr(main, "claim_next_export_job", lambda: None)
+    monkeypatch.setattr(main, "_claim_backoff_wait", lambda: None)
+    monkeypatch.setattr(main, "supabase_rpc", rpc)
+    monkeypatch.setattr(main, "_skip_if_cancelled", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(main, "latest_asset", lambda *_args, **_kwargs: {"url": "https://example.com/plate.3mf"})
+    monkeypatch.setattr(main, "set_status", lambda _order_id, status: operations.append(("status", status)) or {"ok": True})
+    monkeypatch.setattr(main, "supabase_insert", lambda table, payload: operations.append((table, payload)))
+    monkeypatch.setattr(main, "log", lambda *_args, **_kwargs: None)
+
+    assert main.loop_once() is True
+    assert rpc_calls == [("claim_dispatching_order", {"p_worker_id": main.WORKER_ID})]
+    printing_index = operations.index(("status", "printing"))
+    link_index = next(
+        index
+        for index, (kind, payload) in enumerate(operations)
+        if kind == "chat_messages" and "Open to print: bambu-connect://" in payload["content_json"]["text"]
+    )
+    assert printing_index < link_index
+
+
 def test_export_completion_maps_to_stl_ready(monkeypatch):
     import main
 

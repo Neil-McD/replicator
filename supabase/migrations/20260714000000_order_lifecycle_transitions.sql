@@ -516,3 +516,44 @@ is 'Server-only atomic claim for the next queued i23d generation task.';
 
 revoke all on function public.claim_i23d_task(uuid) from public, anon, authenticated;
 grant execute on function public.claim_i23d_task(uuid) to service_role;
+
+-- Dispatch is lifecycle work, but claiming it must not project a different
+-- lifecycle status. Lease one dispatching order atomically so only the worker
+-- that owns the lease can perform dispatching -> printing.
+create function public.claim_dispatching_order(p_worker_id uuid)
+returns public.orders
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  claimed public.orders;
+begin
+  update public.orders o
+  set worker_id = p_worker_id,
+      locked_at = now()
+  where o.id = (
+    select id
+    from public.orders
+    where status = 'dispatching'
+      and (
+        worker_id is null
+        or locked_at is null
+        or locked_at < now() - interval '5 minutes'
+      )
+    order by created_at asc
+    for update skip locked
+    limit 1
+  )
+    and o.status = 'dispatching'
+  returning * into claimed;
+
+  return claimed;
+end;
+$$;
+
+comment on function public.claim_dispatching_order(uuid)
+is 'Server-only atomic lease for dispatching orders; preserves lifecycle status.';
+
+revoke all on function public.claim_dispatching_order(uuid) from public, anon, authenticated;
+grant execute on function public.claim_dispatching_order(uuid) to service_role;

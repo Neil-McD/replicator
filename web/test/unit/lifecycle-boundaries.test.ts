@@ -93,6 +93,7 @@ test('migration replaces the legacy claim RPC safely and keeps worker RPCs servi
     'public.transition_order_lifecycle(uuid,text,text[],text,text,text,text,text,jsonb,jsonb)',
     'public.request_order_job(uuid,text,text,uuid,numeric,numeric,uuid,text,text)',
     'public.claim_i23d_task(uuid)',
+    'public.claim_dispatching_order(uuid)',
   ]) {
     const escapedSignature = signature.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     assert.match(
@@ -104,4 +105,11 @@ test('migration replaces the legacy claim RPC safely and keeps worker RPCs servi
       new RegExp(`grant execute on function ${escapedSignature} to service_role;`, 'i'),
     )
   }
+
+  assert.match(migration, /create function public\.claim_dispatching_order\(p_worker_id uuid\)/i)
+  assert.match(migration, /where status = 'dispatching'[\s\S]*for update skip locked/i)
+  assert.doesNotMatch(
+    migration.match(/create function public\.claim_dispatching_order[\s\S]*?grant execute on function public\.claim_dispatching_order\(uuid\) to service_role;/i)?.[0] ?? '',
+    /set status\s*=/i,
+  )
 })
