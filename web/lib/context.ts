@@ -3,7 +3,7 @@ import { createAdminClient, normalizeSupabaseUrl, signedUrlWithInfo } from '@/li
 export type ContextSnapshot = {
   orderId: string
   status: string | null
-  quote?: { minutes?: number; grams?: number; price_cents?: number } | null
+  quote?: { minutes?: number; grams?: number; price_cents?: number; total_cents?: number } | null
   images: { id: string; url: string; storage_url?: string | null; expires_at?: number | null }[]
   attachments?: {
     asset_id: string
@@ -128,7 +128,7 @@ export async function buildContextSnapshot(orderId: string, opts?: { maxImages?:
       const take = sorted.slice(0, maxAngles)
       const labels: string[] = []
       const image_ids: string[] = []
-      const images: { id: string; url: string; label?: string }[] = []
+      const images: { id: string; url: string; label?: string; storage_url?: string | null; expires_at?: number | null }[] = []
       for (const r of take) {
         const lab = (r as any)?.meta_json?.angle || null
         let url = r.url

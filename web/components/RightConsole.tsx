@@ -1,5 +1,6 @@
 "use client"
 import ChatPanel from './ChatPanel'
+import type { ContextSnapshot } from '@/lib/context'
 
 export default function RightConsole({
   orderId,
@@ -14,7 +15,7 @@ export default function RightConsole({
   loadingSnapshot?: boolean
   initialMessages?: { id: string; role: 'user' | 'assistant' | 'tool'; type?: string | null; content?: any; created_at?: string | null }[]
   initialStatus?: string | null
-  initialAttachments?: { asset_id: string; url: string; storage_url?: string | null; expires_at?: number | null; pending?: boolean | null; label?: string | null; name?: string | null; size?: number | null; content_type?: string | null }[]
+  initialAttachments?: ContextSnapshot['attachments']
   onOrderCreated?: (id: string) => void
   onViewerFocus?: (kind: 'stl'|'glb'|'gltf'|'obj'|'toolpath', url: string, assetKind?: string | null, meta?: { assetId?: string | null; createdAt?: string | number | null }) => void
 }) {
