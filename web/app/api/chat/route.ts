@@ -90,8 +90,9 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'not_authenticated' }, { status })
     }
     const supabase = createAdminClient()
-    const { orderId, message } = (await req.json().catch(() => ({}))) as { orderId?: string; message?: string }
-    if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 })
+    const { orderId: requestedOrderId, message } = (await req.json().catch(() => ({}))) as { orderId?: string; message?: string }
+    if (!requestedOrderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 })
+    const orderId: string = requestedOrderId
     if (!message || typeof message !== 'string') return NextResponse.json({ error: 'message required' }, { status: 400 })
     try {
       await requireOrderAccess(supabase, orderId, auth, 'id,user_id,status')
@@ -394,7 +395,7 @@ export async function POST(req: Request) {
             try { snap = await buildContextSnapshot(orderId, { maxImages, maxAngles }) } catch {}
             if (snap) {
               messages = [
-                { role: 'system', content: `FACTS: ${JSON.stringify({ status: snap.status, quote: snap.quote, selected_image_id: snap.selected_image_id, chosen_index: snap.chosen_index, images: (snap.images||[]).map(x=>x.id).slice(0, maxImages), angles: (snap.angles||[]).map(a=>({ parent_image_id:a.parent_image_id, parent_index:a.parent_index||null, labels:a.labels, image_ids:a.image_ids })), last_angles_parent_id: snap.last_angles_parent_id||null, has_stl: !!snap.geometry?.stl_url })}` },
+                { role: 'system', content: `FACTS: ${JSON.stringify({ status: snap.status, quote: snap.quote, selected_image_id: snap.selected_image_id, chosen_index: snap.chosen_index, images: (snap.images||[]).map((x: any)=>x.id).slice(0, maxImages), angles: (snap.angles||[]).map((a: any)=>({ parent_image_id:a.parent_image_id, parent_index:a.parent_index||null, labels:a.labels, image_ids:a.image_ids })), last_angles_parent_id: snap.last_angles_parent_id||null, has_stl: !!snap.geometry?.stl_url })}` },
                 ...messages,
               ]
             }
