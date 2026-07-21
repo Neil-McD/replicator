@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { handleStoreRequest } from '@/app/api/orders/[id]/store/route'
+import { handleStoreRequest } from '@/app/api/orders/[id]/store/handler'
 
 class StubSupabase {
   tables: Record<string, any>
