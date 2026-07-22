@@ -1,6 +1,8 @@
 import { createAdminClient } from '@/lib/supabaseAdmin'
 import PrintNowButton from '@/components/PrintNowButton'
 
+export const dynamic = 'force-dynamic'
+
 type Row = {
   id: string
   status: string

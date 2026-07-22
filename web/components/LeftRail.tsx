@@ -214,7 +214,7 @@ export default function LeftRail({
 
   async function renameOrder(id: string, name: string): Promise<boolean> {
     const next = name.trim().slice(0, 200)
-    if (!next) return
+    if (!next) return false
     setRenameError(null)
     try {
       // Optimistic local overlay + cross-tab notify

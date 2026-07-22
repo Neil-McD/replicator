@@ -234,7 +234,8 @@ export async function POST(req: Request) {
     })
     if (assetErr) throw assetErr
 
-    const preview = parseDataUrl(formData.get('previewDataUrl'))
+    const previewDataUrl = formData.get('previewDataUrl')
+    const preview = parseDataUrl(typeof previewDataUrl === 'string' ? previewDataUrl : null)
     if (preview) {
       const previewPath = `products/${productId}/v${versionNumber}/thumbnail-${randomUUID()}.${preview.ext}`
       const { error: previewUploadErr } = await supabase.storage
